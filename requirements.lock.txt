@@ -12,7 +12,7 @@ cloudpickle==1.3.0
 conda-pack==0.8.1
 contourpy==1.3.3
 cycler==0.12.1
--e git+https://github.com/lakshya-asu/Discover-Intervene-Adapt-Interleaved-Causal-RL.git@a7fbcab371fa4539351b9647e157431511e8be08#egg=discover_intervene_adapt
+-e git+https://github.com/lakshya-asu/Discover-Intervene-Adapt-Interleaved-Causal-RL.git@05adb45ff1b25a7858893c88d768435676c231be#egg=discover_intervene_adapt
 docutils==0.21.2
 Farama-Notifications==0.0.4
 filelock @ file:///home/conda/feedstock_root/build_artifacts/filelock_1755216263872/work
