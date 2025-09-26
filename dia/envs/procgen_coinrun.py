@@ -6,33 +6,47 @@ from procgen import ProcgenGym3Env
 from .base import EnvAPI
 
 class ProcgenCoinRunEnv(EnvAPI):
-    """Wraps ProcgenGym3Env to present a Gymnasium-style single-env API."""
+    """Wrap ProcgenGym3Env with a Gymnasium-style single-env API."""
 
     def __init__(self, start_level=0, num_levels=1, render=False):
-        self._env = ProcgenGym3Env(num=1, env_name="coinrun",
-                                   start_level=start_level, num_levels=num_levels,
-                                   render=render)
-        # Procgen returns dict of arrays; we pick 'rgb' channel
-        self.observation_space = spaces.Box(low=0, high=255, shape=(64, 64, 3), dtype=np.uint8)
-        self.action_space = spaces.Discrete(15)
+        self._env = ProcgenGym3Env(
+            num=1, env_name="coinrun", start_level=start_level, num_levels=num_levels, render=render
+        )
+        self._observation_space = spaces.Box(low=0, high=255, shape=(64, 64, 3), dtype=np.uint8)
+        self._action_space = spaces.Discrete(15)
+
+    @property
+    def observation_space(self):
+        return self._observation_space
+
+    @property
+    def action_space(self):
+        return self._action_space
 
     def reset(self, seed: int | None = None, options: dict | None = None):
         if seed is not None:
             self._env.seed(seed)
         obs = self._env.reset()
-        rgb = obs["rgb"][0]  # (1, 64, 64, 3)
-        info = {"level_seed": self._env.get_info()[0].get("level_seed", None)}
+        rgb = obs["rgb"][0]
+        info_list = self._env.get_info()
+        info = info_list[0] if info_list else {}
         return rgb, info
 
     def step(self, action):
         act = np.array([action], dtype=np.int32)
         self._env.step(act)
         obs = self._env.observe()
-        rew = self._env.get_reward()[0]
-        first = self._env.get_first()[0]   # episode start flag
-        done = self._env.get_done()[0]     # episode end flag
+        rew = float(self._env.get_reward()[0])
+        done = bool(self._env.get_done()[0])
         rgb = obs["rgb"][0]
-        info = self._env.get_info()[0]
-        terminated = bool(done)
-        truncated = False  # Procgen doesn't separate; treat done as terminal
-        return rgb, float(rew), terminated, truncated, info
+        info_list = self._env.get_info()
+        info = info_list[0] if info_list else {}
+        terminated = done
+        truncated = False
+        return rgb, rew, terminated, truncated, info
+
+    def close(self):
+        try:
+            self._env.close()
+        except Exception:
+            pass
