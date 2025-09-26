@@ -5,7 +5,7 @@ from procgen import ProcgenGym3Env
 from .base import EnvAPI
 
 class ProcgenCoinRunEnv(EnvAPI):
-    """Direct Procgen2 (gym3) wrapper for CoinRun (returns uint8 images)."""
+    """Procgen2 wrapper for CoinRun (returns uint8 images)."""
 
     def __init__(self, start_level=0, num_levels=1):
         self._env = ProcgenGym3Env(
@@ -33,17 +33,19 @@ class ProcgenCoinRunEnv(EnvAPI):
 
     def reset(self, seed: int | None = None, options: dict | None = None):
         self._t = 0
-        obs = self._env.observe()        # returns array of shape (1,64,64,3)
-        obs = self._cast_obs(obs[0])     # drop batch dim
+        obs = self._env.get_images()[0]     # (64,64,3)
+        obs = self._cast_obs(obs)
         return obs, {"stub": True}
 
     def step(self, action):
         self._t += 1
         self._env.act(np.array([action]))
-        obs = self._env.observe()
-        obs = self._cast_obs(obs[0])
-        # Rewards/dones aren’t directly needed for smoke test → stub them
-        return obs, 0.0, False, False, {"stub": True}
+        obs = self._env.get_images()[0]
+        obs = self._cast_obs(obs)
+        # get_rewards and get_dones are available too
+        rew = float(self._env.get_rewards()[0])
+        done = bool(self._env.get_dones()[0])
+        return obs, rew, done, False, {"stub": True}
 
     def close(self):
         self._env.close()
