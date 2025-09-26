@@ -5,7 +5,7 @@ from procgen import ProcgenGym3Env
 from .base import EnvAPI
 
 class ProcgenCoinRunEnv(EnvAPI):
-    """Procgen2 wrapper for CoinRun using gym3-style API."""
+    """Procgen2 wrapper for CoinRun, using correct observe() order."""
 
     def __init__(self, start_level=0, num_levels=1):
         self._env = ProcgenGym3Env(
@@ -33,16 +33,20 @@ class ProcgenCoinRunEnv(EnvAPI):
 
     def reset(self, seed: int | None = None, options: dict | None = None):
         self._t = 0
-        obs, rew, done = self._env.observe()
-        obs = self._cast_obs(obs[0])   # drop batch dim
+        tup = self._env.observe()
+        obs = tup[-1][0]                # take last item, drop batch dim
+        obs = self._cast_obs(obs)
         return obs, {"stub": True}
 
     def step(self, action):
         self._t += 1
         self._env.act(np.array([action]))
-        obs, rew, done = self._env.observe()
-        obs = self._cast_obs(obs[0])
-        return obs, float(rew[0]), bool(done[0]), False, {"stub": True}
+        tup = self._env.observe()
+        obs = tup[-1][0]
+        obs = self._cast_obs(obs)
+        rew = float(tup[0][0])
+        done = bool(tup[1][0])
+        return obs, rew, done, False, {"stub": True}
 
     def close(self):
         self._env.close()
