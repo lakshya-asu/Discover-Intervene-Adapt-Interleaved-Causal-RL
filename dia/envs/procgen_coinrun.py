@@ -5,7 +5,7 @@ from procgen import ProcgenGym3Env
 from .base import EnvAPI
 
 class ProcgenCoinRunEnv(EnvAPI):
-    """Direct Procgen2 (gym3) wrapper for CoinRun."""
+    """Direct Procgen2 (gym3) wrapper for CoinRun (raw array return)."""
 
     def __init__(self, start_level=0, num_levels=1):
         self._env = ProcgenGym3Env(
@@ -30,14 +30,13 @@ class ProcgenCoinRunEnv(EnvAPI):
         self._t = 0
         obs = self._env.observe()[0]  # shape (64,64,3)
         info = {"stub": True}
-        return {"rgb": obs}, info
+        return obs, info
 
     def step(self, action):
         self._t += 1
-        # gym3 API expects list/array of actions
         self._env.act(np.array([action]))
         obs, rew, first, done = self._env.observe()
-        return {"rgb": obs[0]}, float(rew[0]), bool(done[0]), False, {"stub": True}
+        return obs[0], float(rew[0]), bool(done[0]), False, {"stub": True}
 
     def close(self):
         self._env.close()
