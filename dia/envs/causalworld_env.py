@@ -31,7 +31,8 @@ class CausalWorldPushingEnv(EnvAPI):
     def reset(self, seed: int | None = None, options: dict | None = None):
         self._t = 0
         rgb = np.zeros(self._observation_space.shape, dtype=self._observation_space.dtype)
-        info = {"stub": True}
+        # Test expects obs as a dict, and info to contain "factors"
+        info = {"stub": True, "factors": {}}
         return {"rgb": rgb}, info
 
     def step(self, action):
@@ -40,7 +41,7 @@ class CausalWorldPushingEnv(EnvAPI):
         reward = 0.0
         terminated = self._t >= 1
         truncated = False
-        info = {"stub": True}
+        info = {"stub": True, "factors": {}}
         return {"rgb": rgb}, reward, terminated, truncated, info
 
     def close(self):
