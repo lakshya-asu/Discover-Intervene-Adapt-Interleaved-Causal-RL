@@ -13,6 +13,7 @@ class ProcgenCoinRunEnv(EnvAPI):
         )
         self._observation_space = spaces.Box(low=0, high=255, shape=(64, 64, 3), dtype=np.uint8)
         self._action_space = spaces.Discrete(15)
+        self._t = 0
 
     @property
     def observation_space(self):
@@ -23,8 +24,10 @@ class ProcgenCoinRunEnv(EnvAPI):
         return self._action_space
 
     def reset(self, seed: int | None = None, options: dict | None = None):
-        # gym3 Procgen has no .seed(); for determinism use start_level/num_levels at init.
-        obs = self._env.reset()
+        # gym3 Procgen has no .reset() or .seed(); initial state is ready on construction.
+        # For determinism use start_level/num_levels in __init__.
+        self._t = 0
+        obs = self._env.observe()            # dict of arrays
         rgb = obs["rgb"][0]
         info_list = self._env.get_info()
         info = info_list[0] if info_list else {}
