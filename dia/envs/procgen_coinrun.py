@@ -7,6 +7,8 @@ from .base import EnvAPI
 class ProcgenCoinRunEnv(EnvAPI):
     """Robust wrapper for Procgen2 CoinRun that auto-detects image slot."""
 
+    NUM_ACTIONS = 15  # standard for CoinRun
+
     def __init__(self, start_level=0, num_levels=1):
         self._env = ProcgenGym3Env(
             num=1,
@@ -16,7 +18,7 @@ class ProcgenCoinRunEnv(EnvAPI):
         )
         self._t = 0
         self._observation_space = spaces.Box(low=0, high=255, shape=(64, 64, 3), dtype=np.uint8)
-        self._action_space = spaces.Discrete(15)
+        self._action_space = spaces.Discrete(self.NUM_ACTIONS)
 
     @property
     def observation_space(self):
