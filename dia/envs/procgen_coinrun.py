@@ -1,21 +1,20 @@
 from __future__ import annotations
 import numpy as np
-import gymnasium as gym
 from gymnasium import spaces
+from procgen import ProcgenGym3Env
 from .base import EnvAPI
 
 class ProcgenCoinRunEnv(EnvAPI):
-    """Gymnasium wrapper for CoinRun via procgen2."""
+    """Direct Procgen2 (gym3) wrapper for CoinRun."""
 
     def __init__(self, start_level=0, num_levels=1):
-        # Must use the full namespace id
-        self._env = gym.make(
-            "procgen:procgen-coinrun-v0",
+        self._env = ProcgenGym3Env(
+            num=1,
+            env_name="coinrun",
             start_level=start_level,
             num_levels=num_levels,
-            render_mode=None,
         )
-        # Wrap obs to 64x64x3 dict
+        self._t = 0
         self._observation_space = spaces.Box(low=0, high=255, shape=(64, 64, 3), dtype=np.uint8)
         self._action_space = spaces.Discrete(15)
 
@@ -28,12 +27,17 @@ class ProcgenCoinRunEnv(EnvAPI):
         return self._action_space
 
     def reset(self, seed: int | None = None, options: dict | None = None):
-        obs, info = self._env.reset(seed=seed, options=options)
-        return {"rgb": obs}, info or {}
+        self._t = 0
+        obs = self._env.observe()[0]  # shape (64,64,3)
+        info = {"stub": True}
+        return {"rgb": obs}, info
 
     def step(self, action):
-        obs, rew, terminated, truncated, info = self._env.step(action)
-        return {"rgb": obs}, float(rew), bool(terminated), bool(truncated), info or {}
+        self._t += 1
+        # gym3 API expects list/array of actions
+        self._env.act(np.array([action]))
+        obs, rew, first, done = self._env.observe()
+        return {"rgb": obs[0]}, float(rew[0]), bool(done[0]), False, {"stub": True}
 
     def close(self):
         self._env.close()
