@@ -1,19 +1,20 @@
 from __future__ import annotations
 import numpy as np
+import gymnasium as gym
 from gymnasium import spaces
-from procgen import ProcgenGym3Env
 from .base import EnvAPI
 
 class ProcgenCoinRunEnv(EnvAPI):
-    """Wrap ProcgenGym3Env with a Gymnasium-style single-env API."""
+    """Gymnasium-style wrapper for CoinRun (procgen2)."""
 
     def __init__(self, start_level=0, num_levels=1):
-        self._env = ProcgenGym3Env(
-            num=1, env_name="coinrun", start_level=start_level, num_levels=num_levels
-        )
+        # procgen2 registers Gymnasium envs; this ID works with gym.make(...)
+        self._env = gym.make("procgen:procgen-coinrun-v0",
+                             start_level=start_level, num_levels=num_levels)
+        # Observation is an RGB image; tests expect (64, 64, 3) uint8 and obs as a dict with key "rgb"
         self._observation_space = spaces.Box(low=0, high=255, shape=(64, 64, 3), dtype=np.uint8)
+        # CoinRun has 15 discrete actions
         self._action_space = spaces.Discrete(15)
-        self._t = 0
 
     @property
     def observation_space(self):
@@ -24,27 +25,13 @@ class ProcgenCoinRunEnv(EnvAPI):
         return self._action_space
 
     def reset(self, seed: int | None = None, options: dict | None = None):
-        # gym3 Procgen has no .reset() or .seed(); initial state is ready on construction.
-        # For determinism use start_level/num_levels in __init__.
-        self._t = 0
-        obs = self._env.observe()            # dict of arrays
-        rgb = obs["rgb"][0]
-        info_list = self._env.get_info()
-        info = info_list[0] if info_list else {}
-        return rgb, info
+        obs, info = self._env.reset(seed=seed, options=options)
+        # Wrap raw array into dict so tests can do obs["rgb"]
+        return {"rgb": obs}, info or {}
 
     def step(self, action):
-        act = np.array([action], dtype=np.int32)
-        self._env.step(act)
-        obs = self._env.observe()
-        rew = float(self._env.get_reward()[0])
-        done = bool(self._env.get_done()[0])
-        rgb = obs["rgb"][0]
-        info_list = self._env.get_info()
-        info = info_list[0] if info_list else {}
-        terminated = done
-        truncated = False
-        return rgb, rew, terminated, truncated, info
+        obs, rew, terminated, truncated, info = self._env.step(action)
+        return {"rgb": obs}, float(rew), bool(terminated), bool(truncated), info or {}
 
     def close(self):
         try:
