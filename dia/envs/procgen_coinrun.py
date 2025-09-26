@@ -1,18 +1,23 @@
 from __future__ import annotations
+
 import numpy as np
-import gymnasium as gym
 from gymnasium import spaces
 from procgen import ProcgenGym3Env
+
 from .base import EnvAPI
+
 
 class ProcgenCoinRunEnv(EnvAPI):
     """Wrap ProcgenGym3Env with a Gymnasium-style single-env API."""
 
-    def __init__(self, start_level=0, num_levels=1, render=False):
+    def __init__(self, start_level=0, num_levels=1):
+        # NOTE: BaseProcgenEnv doesn't accept a 'render' kw; don't pass it.
         self._env = ProcgenGym3Env(
-            num=1, env_name="coinrun", start_level=start_level, num_levels=num_levels, render=render
+            num=1, env_name="coinrun", start_level=start_level, num_levels=num_levels
         )
-        self._observation_space = spaces.Box(low=0, high=255, shape=(64, 64, 3), dtype=np.uint8)
+        self._observation_space = spaces.Box(
+            low=0, high=255, shape=(64, 64, 3), dtype=np.uint8
+        )
         self._action_space = spaces.Discrete(15)
 
     @property
