@@ -16,6 +16,7 @@ class ProcgenCoinRunEnv(EnvAPI):
             start_level=start_level,
             num_levels=num_levels,
         )
+        self.level_seed = start_level if num_levels == 0 else None
         self._t = 0
         self._observation_space = spaces.Box(low=0, high=255, shape=(64, 64, 3), dtype=np.uint8)
         self._action_space = spaces.Discrete(self.NUM_ACTIONS)
