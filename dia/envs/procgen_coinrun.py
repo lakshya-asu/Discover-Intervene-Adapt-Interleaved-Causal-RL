@@ -34,15 +34,15 @@ class ProcgenCoinRunEnv(EnvAPI):
 
     def reset(self, seed: int | None = None, options: dict | None = None):
         self._t = 0
-        obs, _, _, _ = self._env.observe()
-        obs = self._cast_obs(obs[0])  # drop batch dimension
+        obs, _, _ = self._env.observe()   # 3 outputs
+        obs = self._cast_obs(obs[0])      # drop batch dim
         return obs, {"stub": True}
 
     def step(self, action):
         self._t += 1
         self._env.act(np.array([action]))
-        obs, rew, first, done = self._env.observe()
-        obs = self._cast_obs(obs[0])  # drop batch dimension
+        obs, rew, done = self._env.observe()
+        obs = self._cast_obs(obs[0])
         return obs, float(rew[0]), bool(done[0]), False, {"stub": True}
 
     def close(self):
