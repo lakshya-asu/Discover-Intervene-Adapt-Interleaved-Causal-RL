@@ -1,25 +1,17 @@
-# Python
 __pycache__/
 *.py[cod]
 *.ipynb_checkpoints
 .venv/
 .env
-.envrc
 dist/
 build/
 *.egg-info/
-
-# VS Code
 .vscode/
-
-# Data / runs
 results/
 runs/
 wandb/
 checkpoints/
 logs/
 tb/
-
-# OS
 .DS_Store
 Thumbs.db
