@@ -5,7 +5,7 @@ from procgen import ProcgenGym3Env
 from .base import EnvAPI
 
 class ProcgenCoinRunEnv(EnvAPI):
-    """Procgen2 wrapper for CoinRun, using correct observe() order."""
+    """Robust wrapper for Procgen2 CoinRun that auto-detects image slot."""
 
     def __init__(self, start_level=0, num_levels=1):
         self._env = ProcgenGym3Env(
@@ -26,27 +26,28 @@ class ProcgenCoinRunEnv(EnvAPI):
     def action_space(self):
         return self._action_space
 
-    def _cast_obs(self, obs):
-        if obs.dtype != np.uint8:
-            obs = (obs * 255).clip(0, 255).astype(np.uint8)
-        return obs
+    def _extract_obs(self, tup):
+        """Find the dict with 'rgb' and return the image array."""
+        for part in tup:
+            if isinstance(part, dict) and "rgb" in part:
+                rgb = part["rgb"][0]  # drop batch
+                return rgb.astype(np.uint8)
+        raise RuntimeError(f"No rgb found in observe() output: {tup}")
 
     def reset(self, seed: int | None = None, options: dict | None = None):
         self._t = 0
         tup = self._env.observe()
-        obs = tup[-1][0]                # take last item, drop batch dim
-        obs = self._cast_obs(obs)
+        obs = self._extract_obs(tup)
         return obs, {"stub": True}
 
     def step(self, action):
         self._t += 1
         self._env.act(np.array([action]))
         tup = self._env.observe()
-        obs = tup[-1][0]
-        obs = self._cast_obs(obs)
-        rew = float(tup[0][0])
-        done = bool(tup[1][0])
-        return obs, rew, done, False, {"stub": True}
+        obs = self._extract_obs(tup)
+        reward = float(tup[0][0]) if isinstance(tup[0], np.ndarray) else 0.0
+        done = bool(tup[-1][0]) if isinstance(tup[-1], np.ndarray) else False
+        return obs, reward, done, False, {"stub": True}
 
     def close(self):
         self._env.close()
