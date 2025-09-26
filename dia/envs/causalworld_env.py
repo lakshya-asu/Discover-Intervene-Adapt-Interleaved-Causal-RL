@@ -4,18 +4,16 @@ from gymnasium import spaces
 from .base import EnvAPI
 
 try:
-    import causal_world as cw  # noqa: F401  # we only need presence for now
+    import causal_world as cw  # noqa: F401
     _HAS_CW = True
 except Exception:
     _HAS_CW = False
 
 
 class CausalWorldPushingEnv(EnvAPI):
-    """Minimal stub so tests can reset/step/close without heavy CW deps.
-    Sprint-2 will wire this to the real CausalWorld pushing task.
-    """
+    """Minimal stub so tests can reset/step/close; real CW wiring in Sprint-2."""
 
-    def __init__(self, obs_shape=(84, 84, 3), act_dim=4):
+    def __init__(self, obs_shape=(64, 64, 3), act_dim=4):
         if not _HAS_CW:
             raise ImportError("causal_world not installed. Install from source and retry.")
         self._observation_space = spaces.Box(low=0, high=255, shape=obs_shape, dtype=np.uint8)
@@ -40,7 +38,7 @@ class CausalWorldPushingEnv(EnvAPI):
         self._t += 1
         rgb = np.zeros(self._observation_space.shape, dtype=self._observation_space.dtype)
         reward = 0.0
-        terminated = self._t >= 1   # end immediately for smoke
+        terminated = self._t >= 1
         truncated = False
         info = {"stub": True}
         return {"rgb": rgb}, reward, terminated, truncated, info
