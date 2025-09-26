@@ -5,7 +5,7 @@ from procgen import ProcgenGym3Env
 from .base import EnvAPI
 
 class ProcgenCoinRunEnv(EnvAPI):
-    """Direct Procgen2 (gym3) wrapper for CoinRun (raw array return)."""
+    """Direct Procgen2 (gym3) wrapper for CoinRun (returns uint8 images)."""
 
     def __init__(self, start_level=0, num_levels=1):
         self._env = ProcgenGym3Env(
@@ -26,9 +26,15 @@ class ProcgenCoinRunEnv(EnvAPI):
     def action_space(self):
         return self._action_space
 
+    def _cast_obs(self, obs):
+        # procgen returns float32 [0,1]; convert to uint8 [0,255]
+        if obs.dtype != np.uint8:
+            obs = (obs * 255).clip(0, 255).astype(np.uint8)
+        return obs
+
     def reset(self, seed: int | None = None, options: dict | None = None):
         self._t = 0
-        obs = self._env.observe()[0]  # shape (64,64,3)
+        obs = self._cast_obs(self._env.observe()[0])
         info = {"stub": True}
         return obs, info
 
@@ -36,7 +42,8 @@ class ProcgenCoinRunEnv(EnvAPI):
         self._t += 1
         self._env.act(np.array([action]))
         obs, rew, first, done = self._env.observe()
-        return obs[0], float(rew[0]), bool(done[0]), False, {"stub": True}
+        obs = self._cast_obs(obs[0])
+        return obs, float(rew[0]), bool(done[0]), False, {"stub": True}
 
     def close(self):
         self._env.close()
