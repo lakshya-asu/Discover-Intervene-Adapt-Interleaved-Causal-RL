@@ -1,4 +1,4 @@
-
+```markdown
 # Discover–Intervene–Adapt (DIA): Interpretable & Adaptive Causal RL
 
 > A research codebase implementing the DIA paradigm: **Discover** causal structure, **Intervene** with learned skills, and **Adapt** policies—interleaved in one loop—to achieve **generalizable** and **explainable** behavior.
@@ -11,7 +11,7 @@ Modern RL often overfits to correlations and misses the **mechanisms** that gene
 
 - **Interleaved learning**: structure learning and policy optimization proceed in tandem, each informing the other.
 - **Probabilistic causal beliefs**: a **Probabilistic Causal Graph (PCG)** maintains a posterior over environment-variable dependencies.
-- **Interventional skills**: a **Skill–Intervention Graph (SIG)** organizes options (skills) as interventions over those variables.
+- **Interventional skills**: a **Skill-Intervention Graph (SIG)** organizes options (skills) as interventions over those variables.
 - **Rational exploration**: an **information-gain** bonus prioritizes novel, informative experiments during training.
 
 ---
@@ -23,26 +23,23 @@ Modern RL often overfits to correlations and misses the **mechanisms** that gene
 ```mermaid
 flowchart LR
     subgraph Perception
-      O[Observations] --> E[Encoder f_ψ]
+      O[Observations] --> E[Encoder f_psi]
       E --> X[Environment Variables X]
     end
 
-    subgraph Causal Side
-      X --> PCG[Probabilistic Causal Graph q_φ(A)]
-      PCG --> IG[Information Gain I G_t]
+    subgraph Causal_Side
+      X --> PCG[Probabilistic Causal Graph q_phi(A)]
+      PCG --> IG[Information Gain IG_t]
       IG -->|intrinsic bonus| HL[High-Level Planner/Selector]
     end
 
-    subgraph Control Side
+    subgraph Control_Side
       X --> HL
-      HL -->|choose subgoal g=(X_i, F)| SIG[Skill–Intervention Graph]
-      SIG --> OPT[Option Policy π_k]
+      HL -->|choose subgoal g=(X_i, F)| SIG[Skill-Intervention Graph]
+      SIG --> OPT[Option Policy pi_k]
       OPT --> ACT[Primitive Actions]
       ACT --> O
     end
-
-    classDef dim fill:#f7f7f7,stroke:#bbb,color:#333;
-    class Perception,Causal Side,Control Side dim;
 ```
 
 **Key idea:** the planner chooses **which subgoal to intervene on** (from the SIG), guided by uncertainty in the PCG. Executed interventions feed back as evidence to update the PCG, creating a **closed scientific loop**.
@@ -52,7 +49,7 @@ flowchart LR
 ## Core concepts
 
 - **Environment‑Variable Goal Space (EVGS):** subgoals target interpretable variable changes *(e.g., `has_key↑`, `door_open=v1`)*. Options (skills) are trained to achieve a specific predicate over a variable.
-- **PCG (q_φ(A))**: maintains uncertainty over edges in a DAG on environment variables; updated with interventional data; its **information gain** drives exploration.
+- **PCG (q_phi(A))**: maintains uncertainty over edges in a DAG on environment variables; updated with interventional data; its **information gain** drives exploration.
 - **SIG**: a directed graph over skills; edges encode **prerequisites** and **compatibilities** (what helps what), allowing **composable** plans.
 - **Planner**: sequences options subject to SIG preconditions to achieve task goals; balances extrinsic reward and epistemic bonuses.
 
@@ -77,15 +74,15 @@ flowchart LR
 sequenceDiagram
     participant Env as Environment
     participant Agent as Agent
-    participant PCG as PCG q_φ(A)
+    participant PCG as PCG q_phi(A)
     participant SIG as SIG (skills/options)
 
     Agent->>Env: Execute option k (intervene on g=(X_i,F))
-    Env-->>Agent: Trajectory τ, ΔX
+    Env-->>Agent: Trajectory tau, delta_X
     Agent->>PCG: Update posterior with interventional data
     PCG-->>Agent: Info Gain IG_t, updated edge posteriors
     Agent->>SIG: Update preconditions / add skills from new edges
-    Agent->>Agent: Plan next option (novel → confirmatory → goal-directed)
+    Agent->>Agent: Plan next option (novel -> confirmatory -> goal-directed)
 ```
 
 - **Discover**: update causal beliefs from outcomes of executed options.  
