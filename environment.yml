@@ -1,32 +1,23 @@
 name: dia
 channels:
   - pytorch
-  - nvidia
   - conda-forge
-  - defaults
 dependencies:
-  - python=3.11
-  - pip
-  - numpy
-  - pytorch>=2.5
-  - pytorch-cuda=12.1
-  - torchvision
-  - cmake
-  - patchelf
-  - swig
+  - python=3.10
+  - pip>=23.3
+  - numpy>=1.24
+  - scipy>=1.10
+  - matplotlib>=3.7
+  - pytorch>=2.2
+  - cpuonly
+  - tensorboard>=2.12
+  - networkx>=3.1
   - pip:
-      - "stable-baselines3[extra]>=2.3"
-      - gymnasium
-      - shimmy
-      - procgen2==0.10.7
-      - hydra-core==1.3.2
-      - rich
-      - tensorboard
-      - scikit-learn
-      - opencv-python
-      - ruff
-      - black
-      - isort
-      - pytest
-      - pytest-xdist
-      - pytest-cov
+      # Gym classic API for our minimal envs; compatible with our code
+      - gym==0.26.2
+      - gym-notices>=0.0.8
+      # ProcGen (CoinRun)
+      - procgen>=0.10.7
+      # Atari (Montezuma via ALE; use v5 IDs)
+      - ale-py>=0.8.1
+      - autorom[accept-rom-license]>=0.6.1

@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: dia
+Version: 0.1.0
+Summary: Discover–Intervene–Adapt (DIA) causal RL research codebase
+Requires-Python: >=3.10
