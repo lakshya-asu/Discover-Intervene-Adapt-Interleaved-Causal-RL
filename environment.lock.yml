@@ -1,0 +1,11 @@
+name: dia
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pytorch[version='>=2.3']
+  - pytorch-cuda=12.1
+  - torchvision
+prefix: /home/flux/miniconda/envs/dia
