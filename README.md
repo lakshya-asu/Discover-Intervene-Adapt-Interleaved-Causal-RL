@@ -1,4 +1,4 @@
-```markdown
+
 # Discover–Intervene–Adapt (DIA): Interpretable & Adaptive Causal RL
 
 > A research codebase implementing the DIA paradigm: **Discover** causal structure, **Intervene** with learned skills, and **Adapt** policies—interleaved in one loop—to achieve **generalizable** and **explainable** behavior.
