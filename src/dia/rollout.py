@@ -96,7 +96,7 @@ class DIARunner:
     High-level Discover–Intervene–Adapt loop with:
       - goal-aware selection (if task_goal provided)
       - PCG dataset buffer and periodic fit()
-      - IG logging
+      - IG logging (always KL between old/new edge-probabilities)
       - optional Auto-SIG expansion from PCG posteriors
     """
 
@@ -142,38 +142,46 @@ class DIARunner:
 
     # -------- PCG fitting / SIG expansion --------
 
-    def _maybe_fit_pcg(self) -> Tuple[bool, float]:
+    @staticmethod
+    def _bernoulli_kl(p_new: np.ndarray, p_old: np.ndarray, eps: float = 1e-8) -> float:
+        p_new = np.clip(p_new, eps, 1 - eps)
+        p_old = np.clip(p_old, eps, 1 - eps)
+        kl = p_new * np.log(p_new / p_old) + (1 - p_new) * np.log((1 - p_new) / (1 - p_old))
+        return float(np.sum(kl))
+
+    def _maybe_fit_pcg(self) -> Tuple[bool, float, float]:
         self.steps += 1
         if self.steps % max(1, self.cfg.fit_every) != 0:
-            return False, 0.0
+            return False, 0.0, 0.0
         if len(self.buffer) < self.cfg.min_buffer:
-            return False, 0.0
+            return False, 0.0, 0.0
         if not hasattr(self.pcg, "fit"):
-            return False, 0.0
+            return False, 0.0, 0.0
 
         packed, mask = self.buffer.recent(self.cfg.batch_recent)
         if packed.shape[0] == 0:
-            return False, 0.0
+            return False, 0.0, 0.0
         d = len(self.evgs.var_names)
-        X_targets = packed[:, d:]  # learners expect X (targets) and regress X on X @ W internally
+        # Use X_{t+1} as observational samples; mask marks intervened targets per sample
+        X_targets = packed[:, d:]
 
-        old_probs = getattr(self.pcg, "probs").copy()
-        res = self.pcg.fit(X_targets, mask=mask, epochs=self.cfg.pcg_epochs)
-        new_probs = getattr(self.pcg, "probs")
+        old_probs = np.array(getattr(self.pcg, "probs")).copy()
+        old_entropy = float(getattr(self.pcg, "entropy")()) if hasattr(self.pcg, "entropy") else np.nan
 
-        # IG
-        try:
-            ig_update = float(self.pcg.expected_ig_from_update(new_probs))
-        except Exception:
-            eps = 1e-8
-            p_new = np.clip(new_probs, eps, 1 - eps)
-            p_old = np.clip(old_probs, eps, 1 - eps)
-            kl = p_new * np.log(p_new / p_old) + (1 - p_new) * np.log((1 - p_new) / (1 - p_old))
-            ig_update = float(np.sum(kl))
+        # Fit PCG backend
+        _ = self.pcg.fit(X_targets, mask=mask, epochs=self.cfg.pcg_epochs)
+
+        new_probs = np.array(getattr(self.pcg, "probs"))
+        new_entropy = float(getattr(self.pcg, "entropy")()) if hasattr(self.pcg, "entropy") else np.nan
+
+        # IG: ALWAYS compute KL(old -> new) over Bernoulli edges
+        ig_update = self._bernoulli_kl(new_probs, old_probs)
+        entropy_drop = float(old_entropy - new_entropy) if (not np.isnan(old_entropy) and not np.isnan(new_entropy)) else 0.0
 
         if self.logger:
-            self.logger.add_scalar(f"{self.cfg.log_prefix}/pcg_entropy", float(self.pcg.entropy()))
+            self.logger.add_scalar(f"{self.cfg.log_prefix}/pcg_entropy", new_entropy)
             self.logger.add_scalar(f"{self.cfg.log_prefix}/ig_update", ig_update)
+            self.logger.add_scalar(f"{self.cfg.log_prefix}/entropy_drop", entropy_drop)
 
         # Maybe expand SIG
         if self.cfg.auto_expand_sig and hasattr(self.pcg, "probs"):
@@ -193,7 +201,7 @@ class DIARunner:
                     self.logger.add_scalar(f"{self.cfg.log_prefix}/sig_removed", float(stats["removed"]))
                     self.logger.add_scalar(f"{self.cfg.log_prefix}/sig_created", float(stats["created_skills"]))
 
-        return True, ig_update
+        return True, ig_update, entropy_drop
 
     # -------- main step --------
 
@@ -205,18 +213,12 @@ class DIARunner:
         option = self.get_option(skill)
 
         # Execute option
+        obs = self.env.get_obs() if hasattr(self.env, "get_obs") else self.env.reset()
+        x0 = self.evgs.extract(obs)
         out = option.run(self.env, self.evgs)
         success: bool = bool(out["success"])
         final_obs = out["final_obs"]
-        traj = out.get("trajectory", [])
-        if len(traj) == 0:
-            obs0 = final_obs
-            x0 = self.evgs.extract(obs0)
-            x1 = x0.copy()
-        else:
-            obs0 = traj[0][0]
-            x0 = self.evgs.extract(obs0)
-            x1 = self.evgs.extract(final_obs)
+        x1 = self.evgs.extract(final_obs)
 
         # SIG stats
         delta_x = x1 - x0
@@ -228,7 +230,7 @@ class DIARunner:
         self.buffer.add(x0, x1, intervened_idx=skill.subgoal.var_index)
 
         # Maybe fit PCG & expand SIG
-        did_fit, ig_update = self._maybe_fit_pcg()
+        did_fit, ig_update, entropy_drop = self._maybe_fit_pcg()
 
         rec = {
             "phase": phase,
@@ -239,6 +241,7 @@ class DIARunner:
             "pcg_entropy": float(self.pcg.entropy()) if hasattr(self.pcg, "entropy") else np.nan,
             "ig_update": ig_update if did_fit else 0.0,
             "did_fit_pcg": did_fit,
+            "entropy_drop": entropy_drop if did_fit else 0.0,
             "buffer_size": len(self.buffer),
         }
 
