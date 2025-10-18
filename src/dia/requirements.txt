@@ -1,0 +1,15 @@
+# Core (some are provided by conda too; pip will no-op if already satisfied)
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+tensorboard>=2.12
+networkx>=3.1
+
+# Gym classic API
+gym==0.26.2
+gym-notices>=0.0.8
+
+# OPTIONAL: RL & Atari
+stable-baselines3==1.8.0
+ale-py>=0.8.1
+autorom[accept-rom-license]>=0.6.1
