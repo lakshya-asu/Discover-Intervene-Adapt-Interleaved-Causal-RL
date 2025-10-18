@@ -1,0 +1,19 @@
+name: dia-sb3-legacy
+channels:
+  - pytorch
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip>=23.3
+  - numpy>=1.24
+  - scipy>=1.10
+  - matplotlib>=3.7
+  - pytorch>=2.2
+  - tensorboard>=2.12
+  - networkx>=3.1
+  - pip:
+      - gym==0.21.0
+      - stable-baselines3==1.8.0
+      - cloudpickle>=1.2.0
+      - atari-py==0.2.9
+      - procgen==0.10.7

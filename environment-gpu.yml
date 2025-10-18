@@ -1,6 +1,7 @@
-name: dia
+name: dia-gpu
 channels:
   - pytorch
+  - nvidia
   - conda-forge
 dependencies:
   - python=3.10
@@ -9,15 +10,12 @@ dependencies:
   - scipy>=1.10
   - matplotlib>=3.7
   - pytorch>=2.2
-  - cpuonly
+  - pytorch-cuda=11.8
   - tensorboard>=2.12
   - networkx>=3.1
   - pip:
-      # Gym classic API for our minimal envs; compatible with our code
       - gym==0.26.2
       - gym-notices>=0.0.8
-      # ProcGen (CoinRun)
       - procgen>=0.10.7
-      # Atari (Montezuma via ALE; use v5 IDs)
       - ale-py>=0.8.1
       - autorom[accept-rom-license]>=0.6.1

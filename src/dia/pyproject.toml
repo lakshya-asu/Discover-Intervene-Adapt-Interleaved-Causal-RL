@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dia"
+version = "0.1.0"
+description = "Discover–Intervene–Adapt (DIA) causal RL research codebase"
+requires-python = ">=3.10"
+dependencies = []  # we install deps via conda/pip separately
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
