@@ -14,34 +14,6 @@ Modern RL often overfits to correlations and misses the **mechanisms** that gene
 - **Interventional skills**: a **Skill-Intervention Graph (SIG)** organizes options (skills) as interventions over those variables.
 - **Rational exploration**: an **information-gain** bonus prioritizes novel, informative experiments during training.
 
----
-
-## DIA at a glance
-
-### System overview
-
-```mermaid
-flowchart LR
-    subgraph Perception
-      O[Observations] --> E[Encoder f_psi]
-      E --> X[Environment Variables X]
-    end
-
-    subgraph Causal_Side
-      X --> PCG[Probabilistic Causal Graph q_phi(A)]
-      PCG --> IG[Information Gain IG_t]
-      IG -->|intrinsic bonus| HL[High-Level Planner/Selector]
-    end
-
-    subgraph Control_Side
-      X --> HL
-      HL -->|choose subgoal g=(X_i, F)| SIG[Skill-Intervention Graph]
-      SIG --> OPT[Option Policy pi_k]
-      OPT --> ACT[Primitive Actions]
-      ACT --> O
-    end
-```
-
 **Key idea:** the planner chooses **which subgoal to intervene on** (from the SIG), guided by uncertainty in the PCG. Executed interventions feed back as evidence to update the PCG, creating a **closed scientific loop**.
 
 ---
