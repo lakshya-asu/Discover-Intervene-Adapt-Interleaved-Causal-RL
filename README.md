@@ -114,18 +114,6 @@ Typical measurements:
 └── README.md
 ```
 
----
-
-## Recommendations & Next steps
-
-1. **Drop in the README** above (this file).  
-2. **Docs visuals**: add `docs/diagrams/` and keep Mermaid sources in the README so diagrams render on GitHub.  
-3. **Requirements polish**: update `environment.yml` using the packages listed in the Requirements section.  
-4. **API docstrings**: add short docstrings for `PCG` (posterior updates, info‑gain computation), `SIG` (add_skill, add_edge, prerequisites), `Option` training loop (targeting `(X_i, F)`), and `Planner` (selects next subgoal).  
-5. **Metrics**: log TensorBoard scalars for **PCG entropy**, **edge calibration/ECE**, **option success rate**, **intervention precision**.  
-6. **Checkpoints & reproducibility**: implement checkpointing for PCG state, SIG skills, and option policies; ensure seeding is configurable.
-
----
 
 ## Citing
 
@@ -145,6 +133,6 @@ If you use this codebase, please cite the thesis:
 ---
 
 ## License
-
+```
 MIT — see [`LICENSE`](./LICENSE).
 ```
