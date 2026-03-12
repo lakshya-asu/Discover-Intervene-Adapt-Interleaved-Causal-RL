@@ -41,15 +41,21 @@ def make_montezuma_evgs(var_names: Optional[List[str]] = None) -> EVGS:
 # ------------------------------ ProcGen CoinRun ------------------------------
 
 def make_coinrun_evgs(var_names: Optional[List[str]] = None) -> EVGS:
-    names = var_names or ["coin_collected", "progress", "enemy_near"]
+    """
+    Three semantic variables injected by ProcgenCoinRunInfoWrapper:
+      coin_visible  (0/1) – yellow coin pixels present in frame
+      coin_close    (0/1) – coin centroid in left 55 % of frame
+      coin_collected(0/1) – coin was collected this episode
+    """
+    names = var_names or ["coin_visible", "coin_close", "coin_collected"]
 
     def obs_to_vars(obs):
         d = _ensure_dict_obs(obs)
         info = d.get("info", {}) or {}
-        coin = float(bool(info.get("coin_collected", info.get("level_complete", 0))))
-        progress = float(info.get("progress", 0.0))
-        enemy_near = float(bool(info.get("enemy_near", 0)))
-        return np.array([coin, progress, enemy_near], dtype=float)
+        vis   = float(bool(info.get("coin_visible",   0)))
+        close = float(info.get("coin_close",  0.0))
+        coin  = float(bool(info.get("coin_collected", 0)))
+        return np.array([vis, close, coin], dtype=float)
 
     return EVGS(var_names=names, obs_to_vars=obs_to_vars)
 

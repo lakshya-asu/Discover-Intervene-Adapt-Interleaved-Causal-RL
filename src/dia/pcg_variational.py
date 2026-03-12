@@ -26,7 +26,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
-import torch.nn as nn
 import torch.optim as optim
 
 try:
@@ -80,12 +79,12 @@ class VariationalPCG:
         L = torch.zeros((self.d, self.d), device=self.device)  # logits init at 0 -> P=0.5
         with torch.no_grad():
             L.fill_diagonal_(-1e9)  # force no self-loops
-        self.L = nn.Parameter(L)
+        self.L = L.float().detach().requires_grad_(True)
 
         B = (torch.randn(self.d, self.d, device=self.device) * cfg.init_scale)
         with torch.no_grad():
             B.fill_diagonal_(0.0)
-        self.B = nn.Parameter(B)
+        self.B = B.float().detach().requires_grad_(True)
 
         self._probs_cache = None
         self.step = 0
@@ -99,7 +98,8 @@ class VariationalPCG:
     @property
     def probs(self) -> np.ndarray:
         if self._probs_cache is None:
-            self._probs_cache = self._probs_torch().detach().cpu().numpy()
+            P = self._probs_torch()
+            self._probs_cache = np.array(P.tolist(), dtype=np.float64)
         return self._probs_cache
 
     def entropy(self) -> float:
@@ -187,7 +187,8 @@ class VariationalPCG:
                 X_pred = X_t @ A_eff
                 resid = (X_t - X_pred)
                 resid2 = (resid * Wmask) ** 2
-                reg_losses.append(0.5 * resid2.sum() / float(torch.count_nonzero(Wmask)))
+                n_nonzero = max(1, int(torch.count_nonzero(Wmask).item()))
+                reg_losses.append(0.5 * resid2.sum() / float(n_nonzero))
             loss_reg = torch.stack(reg_losses).mean()
 
             loss_l1 = l1 * torch.sum(torch.abs(B))

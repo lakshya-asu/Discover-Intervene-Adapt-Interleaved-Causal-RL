@@ -147,12 +147,28 @@ class ResourceOption(OptionPolicy):
         if j == 8:  # diamond (needs iron pickaxe)
             if ironpick >= 1:
                 return 8
-            # craft iron pick first
-            return self._next_action(x, env.__class__(cfg=self._cfg_from_env(env))) if False else (
-                # fallback to basic iron-pick crafting steps:
-                7 if (iron >= cfg.iron_for_iron_pick and wood >= cfg.wood_for_iron_pick) else
-                (0 if wood < cfg.wood_for_iron_pick else 6)
-            )
+            # need to craft iron pickaxe first — mirrors j==7 logic exactly
+            if iron >= cfg.iron_for_iron_pick and wood >= cfg.wood_for_iron_pick:
+                return 7
+            if iron < cfg.iron_for_iron_pick:
+                if furnace < 1:
+                    if stone >= cfg.stone_for_furnace:
+                        return 4
+                    return 1
+                if ironore < 1:
+                    if stonepick >= 1 or ironpick >= 1:
+                        return 3
+                    if wood >= cfg.wood_for_stone_pick and stone >= cfg.stone_for_stone_pick:
+                        return 5
+                    if need_wood(cfg.wood_for_stone_pick):
+                        return 0
+                    return 1
+                if coal < 1:
+                    return 2
+                return 6
+            if need_wood(cfg.wood_for_iron_pick):
+                return 0
+            return 7
 
         # default: noop
         return 9

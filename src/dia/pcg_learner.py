@@ -32,7 +32,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch import Tensor
 
@@ -89,12 +88,12 @@ class DifferentiablePCG:
         W = (torch.randn(self.d, self.d, device=self.device) * cfg.init_scale)
         with torch.no_grad():
             W.fill_diagonal_(0.0)
-        self.W = nn.Parameter(W)
+        self.W = W.float().detach().requires_grad_(True)
         self._probs_cache = None
         self.step = 0
 
     def _weights_numpy(self) -> np.ndarray:
-        return self.W.detach().cpu().numpy()
+        return np.array(self.W.detach().cpu().tolist(), dtype=np.float64)
 
     def _probs_from_weights(self, W_np: Optional[np.ndarray] = None) -> np.ndarray:
         """Map weights -> Bernoulli-like probs via sigmoid(alpha * |W| - bias)."""
@@ -187,7 +186,8 @@ class DifferentiablePCG:
             resid = (X_t - X_pred)  # [N, d]
             # Mask residuals for intervened (weight 0): elementwise multiply
             resid2 = (resid * Wmask) ** 2
-            loss_reg = 0.5 * resid2.sum() / float(torch.count_nonzero(Wmask))
+            n_nonzero = max(1, int(torch.count_nonzero(Wmask).item()))
+            loss_reg = 0.5 * resid2.sum() / float(n_nonzero)
 
             loss_l1 = l1 * torch.sum(torch.abs(W))
             loss_l2 = 0.5 * l2 * torch.sum(W ** 2)

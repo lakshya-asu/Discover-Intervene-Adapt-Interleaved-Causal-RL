@@ -1,5 +1,6 @@
 README.md
 pyproject.toml
+setup.py
 src/dia/__init__.py
 src/dia/checkpoint.py
 src/dia/evgs.py
