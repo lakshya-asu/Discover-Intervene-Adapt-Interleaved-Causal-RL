@@ -86,7 +86,8 @@ class RunnerConfig:
     auto_expand_sig: bool = True
     add_threshold: float = 0.75
     remove_threshold: float = 0.55
-    expand_every: int = 0  # 0 => expand right after a fit
+    expand_every: int = 0          # 0 => expand right after a fit
+    create_missing_skills: bool = True  # auto-create skills for new variables in SIG expansion
 
 
 # ----------------------------- DIA Runner -----------------------------
@@ -149,33 +150,92 @@ class DIARunner:
         kl = p_new * np.log(p_new / p_old) + (1 - p_new) * np.log((1 - p_new) / (1 - p_old))
         return float(np.sum(kl))
 
+    @staticmethod
+    def _transition_fit_probs(X_t: np.ndarray, X_tp1: np.ndarray,
+                               alpha: float = 5.0) -> np.ndarray:
+        """
+        Bayesian causal-edge estimation from binary state transitions.
+
+        For each directed edge (i → j) the question is:
+          "Does X_t[i]=1 predict X_tp1[j] increasing, compared to X_t[i]=0?"
+
+        Uses Beta posterior with a symmetric prior of strength `alpha` so that
+        the estimate starts at 0.5 (no evidence) and converges as data accumulates.
+
+        Returns a [d, d] matrix of edge probabilities (diagonal is 0).
+        """
+        if X_t.shape[0] == 0:
+            d = X_t.shape[1] if X_t.ndim > 1 else 1
+            return np.full((d, d), 0.5)
+
+        N, d = X_t.shape
+        probs = np.full((d, d), 0.5, dtype=float)
+
+        for j in range(d):
+            j_up = (X_tp1[:, j] > X_t[:, j]).astype(float)   # 1 when var j increases
+
+            for i in range(d):
+                if i == j:
+                    continue
+                active_i   = (X_t[:, i] > 0.5).astype(float)
+                inactive_i = 1.0 - active_i
+
+                n_active   = float(np.sum(active_i))
+                n_inactive = float(np.sum(inactive_i))
+
+                # Require observations in both groups; without contrast evidence stays 0.5
+                if n_active < 3 or n_inactive < 3:
+                    probs[i, j] = 0.5
+                    continue
+
+                # Beta posterior: (successes + alpha) / (trials + 2*alpha)
+                p_up_active   = (float(np.sum(active_i   * j_up)) + alpha) / (n_active   + 2 * alpha)
+                p_up_inactive = (float(np.sum(inactive_i * j_up)) + alpha) / (n_inactive + 2 * alpha)
+
+                denom = p_up_active + p_up_inactive
+                probs[i, j] = p_up_active / denom if denom > 1e-10 else 0.5
+
+        np.fill_diagonal(probs, 0.0)
+        return probs
+
     def _maybe_fit_pcg(self) -> Tuple[bool, float, float]:
         self.steps += 1
         if self.steps % max(1, self.cfg.fit_every) != 0:
             return False, 0.0, 0.0
         if len(self.buffer) < self.cfg.min_buffer:
             return False, 0.0, 0.0
-        if not hasattr(self.pcg, "fit"):
-            return False, 0.0, 0.0
 
         packed, mask = self.buffer.recent(self.cfg.batch_recent)
         if packed.shape[0] == 0:
             return False, 0.0, 0.0
-        d = len(self.evgs.var_names)
-        # Use X_{t+1} as observational samples; mask marks intervened targets per sample
-        X_targets = packed[:, d:]
 
-        old_probs = np.array(getattr(self.pcg, "probs")).copy()
+        d = len(self.evgs.var_names)
+        X_t_data   = packed[:, :d]   # state BEFORE the option
+        X_tp1_data = packed[:, d:]   # state AFTER the option
+
+        old_probs   = np.array(getattr(self.pcg, "probs")).copy()
         old_entropy = float(getattr(self.pcg, "entropy")()) if hasattr(self.pcg, "entropy") else np.nan
 
-        # Fit PCG backend
-        _ = self.pcg.fit(X_targets, mask=mask, epochs=self.cfg.pcg_epochs)
+        # ── Causal discovery: frequency-based transition estimation ──────────
+        # Computes P(j↑ | i=1 at t) vs P(j↑ | i=0 at t) for every (i,j) pair.
+        # This is a Bayesian estimate over the TEMPORAL transition X_t → X_{t+1},
+        # which is the correct signal for learning causal ordering of EVGS variables.
+        new_probs = self._transition_fit_probs(X_t_data, X_tp1_data)
 
-        new_probs = np.array(getattr(self.pcg, "probs"))
+        if hasattr(self.pcg, "apply_update"):
+            self.pcg.apply_update(new_probs)
+        elif hasattr(self.pcg, "fit"):
+            # Fallback for PCGs without apply_update (legacy or custom)
+            try:
+                _ = self.pcg.fit(X_tp1_data, mask=mask, epochs=self.cfg.pcg_epochs)
+                new_probs = np.array(getattr(self.pcg, "probs"))
+            except Exception:
+                pass
+
+        new_probs   = np.array(getattr(self.pcg, "probs"))
         new_entropy = float(getattr(self.pcg, "entropy")()) if hasattr(self.pcg, "entropy") else np.nan
 
-        # IG: ALWAYS compute KL(old -> new) over Bernoulli edges
-        ig_update = self._bernoulli_kl(new_probs, old_probs)
+        ig_update    = self._bernoulli_kl(new_probs, old_probs)
         entropy_drop = float(old_entropy - new_entropy) if (not np.isnan(old_entropy) and not np.isnan(new_entropy)) else 0.0
 
         if self.logger:
@@ -183,7 +243,7 @@ class DIARunner:
             self.logger.add_scalar(f"{self.cfg.log_prefix}/ig_update", ig_update)
             self.logger.add_scalar(f"{self.cfg.log_prefix}/entropy_drop", entropy_drop)
 
-        # Maybe expand SIG
+        # ── SIG auto-expansion from updated PCG probs ────────────────────────
         if self.cfg.auto_expand_sig and hasattr(self.pcg, "probs"):
             should_expand = (self.cfg.expand_every == 0) or (self.steps % max(1, self.cfg.expand_every) == 0)
             if should_expand:
@@ -192,7 +252,7 @@ class DIARunner:
                     AutoSIGConfig(
                         add_threshold=self.cfg.add_threshold,
                         remove_threshold=self.cfg.remove_threshold,
-                        create_missing_skills=True,
+                        create_missing_skills=self.cfg.create_missing_skills,
                         verbose=False,
                     )
                 )
@@ -226,8 +286,13 @@ class DIARunner:
         if self.logger:
             self.logger.add_scalar(f"{self.cfg.log_prefix}/skill_success_{skill_id}", float(success))
 
-        # Push into PCG buffer, mark target var as intervened
+        # Push option-level transition (x_start → x_end)
         self.buffer.add(x0, x1, intervened_idx=skill.subgoal.var_index)
+
+        # Also push any per-step informative transitions returned by the option
+        # (state changes that happened mid-option, e.g. coin becoming visible)
+        for xt_s, xtp1_s in out.get("step_pairs", []):
+            self.buffer.add(xt_s, xtp1_s, intervened_idx=skill.subgoal.var_index)
 
         # Maybe fit PCG & expand SIG
         did_fit, ig_update, entropy_drop = self._maybe_fit_pcg()

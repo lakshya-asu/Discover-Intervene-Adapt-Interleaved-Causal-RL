@@ -1,0 +1,2 @@
+2026-03-13 10:40:35 flux-ubuntu process_watcher[894933] INFO Process watcher started between parent 894832 and child 894864 
+2026-03-13 10:40:51 flux-ubuntu process_watcher[894933] INFO Parent is not running, hence we need terminate the child.

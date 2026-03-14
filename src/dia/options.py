@@ -95,6 +95,67 @@ class RandomOption(OptionPolicy):
         return self.action_space.sample()
 
 
+class FixedActionOption(OptionPolicy):
+    """
+    Primitive option that executes one fixed action (or cycles through a list).
+
+    Examples
+    --------
+    FixedActionOption(subgoal, cfg, action=7)              # always press RIGHT
+    FixedActionOption(subgoal, cfg, action_cycle=[8, 8, 7])  # jump-right, jump-right, right
+    """
+    def __init__(
+        self,
+        subgoal: Subgoal,
+        cfg: OptionConfig,
+        action: int = 4,                         # default: NOOP
+        action_cycle: Optional[list] = None,     # if set, cycles through these
+    ):
+        super().__init__(subgoal, cfg)
+        self._action       = int(action)
+        self._action_cycle = list(action_cycle) if action_cycle else None
+        self._step_count   = 0
+
+    def act(self, obs) -> int:
+        if self._action_cycle:
+            a = self._action_cycle[self._step_count % len(self._action_cycle)]
+            self._step_count += 1
+            return int(a)
+        return self._action
+
+    def run(self, env, evgs: EVGS) -> Dict[str, Any]:
+        self._step_count = 0
+        obs   = env.get_obs() if hasattr(env, "get_obs") else env.reset()
+        x_t   = evgs.extract(obs)
+        steps = 0
+        success    = False
+        step_pairs: list = []
+
+        while steps < self.cfg.max_steps:
+            action = self.act(obs)
+            next_obs, _rew, done, info = env.step(action)
+            x_tp1     = evgs.extract(next_obs)
+            succ_this = EVGS.predicate_holds(x_t, x_tp1, self.subgoal)
+            if np.any(x_tp1 != x_t):
+                step_pairs.append((x_t.copy(), x_tp1.copy()))
+            obs = next_obs
+            steps += 1
+            if succ_this:
+                success = True
+                if self.cfg.terminate_on_success:
+                    break
+            if done and not info.get("soft_continue", False):
+                break
+            x_t = x_tp1
+
+        return {
+            "success":    success,
+            "steps":      steps,
+            "final_obs":  obs,
+            "step_pairs": step_pairs,
+        }
+
+
 class PPOOption(OptionPolicy):
     """
     Option policy implemented using Stable‑Baselines3 PPO.

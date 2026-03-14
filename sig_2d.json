@@ -1,0 +1,56 @@
+{
+  "names": [
+    "wood",
+    "stone",
+    "coal",
+    "ironore",
+    "furnace",
+    "stonepickaxe",
+    "iron",
+    "ironpickaxe",
+    "diamond"
+  ],
+  "edges": [
+    [
+      5,
+      3
+    ],
+    [
+      1,
+      4
+    ],
+    [
+      0,
+      5
+    ],
+    [
+      1,
+      5
+    ],
+    [
+      4,
+      6
+    ],
+    [
+      2,
+      6
+    ],
+    [
+      3,
+      6
+    ],
+    [
+      6,
+      7
+    ],
+    [
+      0,
+      7
+    ],
+    [
+      7,
+      8
+    ]
+  ],
+  "edge_log": []
+}

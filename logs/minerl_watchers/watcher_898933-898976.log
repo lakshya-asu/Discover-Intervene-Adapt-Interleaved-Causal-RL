@@ -1,0 +1,2 @@
+2026-03-13 10:49:32 flux-ubuntu process_watcher[899033] INFO Process watcher started between parent 898933 and child 898976 
+2026-03-13 10:49:48 flux-ubuntu process_watcher[899033] INFO Child is not running anymore, launcher can terminate.

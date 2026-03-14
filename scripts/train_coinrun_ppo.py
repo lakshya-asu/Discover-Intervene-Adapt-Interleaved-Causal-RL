@@ -7,8 +7,9 @@ and can be loaded by watch_coinrun_dia.py --model models/coinrun_cnn_ppo.zip
 
 Shaped reward (default on):
   - Raw game reward: +10 when coin collected (level complete)
-  - Dense: +0.05 each step the coin is visible in-frame (incentivizes finding it)
-  - Dense: +0.2 each step coin pixel-centroid moves left (agent moving toward coin)
+  - One-shot: +3.0 first time coin becomes visible in an episode (seek reward)
+  - Dense: +0.05 each step the coin is visible in-frame
+  - Dense: +0.40 each step coin pixel-centroid moves left (agent approaching)
 
 Usage:
     conda activate dia
@@ -41,17 +42,23 @@ class CoinRunShapingWrapper(gym.Wrapper):
     Adds dense reward signals on top of the sparse game reward.
     Operates on raw (64, 64, 3) uint8 pixel observations.
 
-      +0.05  per step if coin (yellow) pixels visible
-      +0.20  per step if coin centroid moves left (agent approaching)
-      +10.0  game reward when coin collected (passed through from procgen)
+      +first_sight_bonus  one-shot when coin becomes visible for the first time
+      +0.05               per step if coin (yellow) pixels visible
+      +approach_bonus     per step if coin centroid moves left (agent approaching)
+      +10.0               game reward when coin collected (passed through from procgen)
     """
     YELLOW_R, YELLOW_G, YELLOW_B = 200, 180, 60
     MIN_COIN_PX = 10
 
-    def __init__(self, env, shaping: bool = True):
+    def __init__(self, env, shaping: bool = True,
+                 first_sight_bonus: float = 3.0,
+                 approach_bonus: float = 0.40):
         super().__init__(env)
         self._shaping = shaping
+        self._first_sight_bonus = first_sight_bonus
+        self._approach_bonus = approach_bonus
         self._prev_cx: float | None = None
+        self._coin_ever_seen: bool = False
 
     @staticmethod
     def _coin_centroid(frame: np.ndarray):
@@ -76,6 +83,7 @@ class CoinRunShapingWrapper(gym.Wrapper):
         kwargs.pop("options", None)
         obs = self.env.reset(**kwargs)
         self._prev_cx = None
+        self._coin_ever_seen = False
         return obs
 
     def step(self, action):
@@ -83,10 +91,16 @@ class CoinRunShapingWrapper(gym.Wrapper):
         if self._shaping and isinstance(obs, np.ndarray) and obs.ndim == 3:
             cx, npix = self._coin_centroid(obs)
             if cx is not None:
-                rew += 0.05   # coin visible
+                # One-time bonus the first moment coin becomes visible this episode
+                if not self._coin_ever_seen:
+                    rew += self._first_sight_bonus
+                    self._coin_ever_seen = True
+                rew += 0.05   # coin visible (per-step)
                 if self._prev_cx is not None and cx < self._prev_cx:
-                    rew += 0.20  # centroid moved left → agent approaching
+                    rew += self._approach_bonus  # centroid moved left → approaching
             self._prev_cx = cx
+            if done:
+                self._coin_ever_seen = False
         return obs, rew, done, info
 
 
@@ -95,7 +109,8 @@ class CoinRunShapingWrapper(gym.Wrapper):
 # ---------------------------------------------------------------------------
 
 def make_env(rank: int, seed: int, num_levels: int, start_level: int,
-             shaping: bool) -> callable:
+             shaping: bool, first_sight_bonus: float = 3.0,
+             approach_bonus: float = 0.40) -> callable:
     def _init():
         env = gym.make(
             "procgen:procgen-coinrun-v0",
@@ -103,7 +118,9 @@ def make_env(rank: int, seed: int, num_levels: int, start_level: int,
             start_level=start_level,
             distribution_mode="easy",
         )
-        env = CoinRunShapingWrapper(env, shaping=shaping)
+        env = CoinRunShapingWrapper(env, shaping=shaping,
+                                    first_sight_bonus=first_sight_bonus,
+                                    approach_bonus=approach_bonus)
         return env
     return _init
 
@@ -166,8 +183,12 @@ def main():
     ap.add_argument("--num_levels",  type=int,   default=200,
                     help="ProcGen levels to train on (lower = easier to overfit/memorize)")
     ap.add_argument("--start_level", type=int,   default=0)
-    ap.add_argument("--no_shaping",  action="store_true")
-    ap.add_argument("--out",         type=str,   default="models/coinrun_cnn_ppo")
+    ap.add_argument("--no_shaping",        action="store_true")
+    ap.add_argument("--first_sight_bonus", type=float, default=3.0,
+                    help="One-shot reward the first time coin becomes visible per episode")
+    ap.add_argument("--approach_bonus",    type=float, default=0.40,
+                    help="Per-step reward when coin centroid moves left (agent approaching)")
+    ap.add_argument("--out",               type=str,   default="models/coinrun_cnn_ppo")
     ap.add_argument("--seed",        type=int,   default=0)
     ap.add_argument("--lr",          type=float, default=5e-4)
     ap.add_argument("--n_steps",     type=int,   default=512,
@@ -186,7 +207,9 @@ def main():
     # --- training envs ---
     # DummyVecEnv (single-process) is used throughout: SubprocVecEnv conflicts with
     # the numpy 1.26/torch 2.5 dtype patch needed on this system.
-    env_fns = [make_env(i, args.seed, args.num_levels, args.start_level, shaping)
+    env_fns = [make_env(i, args.seed, args.num_levels, args.start_level, shaping,
+                        first_sight_bonus=args.first_sight_bonus,
+                        approach_bonus=args.approach_bonus)
                for i in range(args.n_envs)]
     venv = DummyVecEnv(env_fns)
     venv = VecFrameStack(venv, n_stack=args.n_stack)
@@ -239,8 +262,9 @@ def main():
     print(f"  CoinRun CNN PPO training")
     print(f"  timesteps={args.timesteps:,}  n_envs={args.n_envs}  "
           f"n_stack={args.n_stack}  num_levels={args.num_levels}")
-    print(f"  shaping={'yes' if shaping else 'no'}  lr={args.lr}  "
-          f"n_steps={args.n_steps}  batch={args.batch_size}")
+    print(f"  shaping={'yes' if shaping else 'no'}  "
+          f"first_sight={args.first_sight_bonus}  approach={args.approach_bonus}")
+    print(f"  lr={args.lr}  n_steps={args.n_steps}  batch={args.batch_size}")
     print(f"  out={args.out}.zip")
     print("=" * 64)
 

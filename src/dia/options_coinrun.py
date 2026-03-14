@@ -52,10 +52,12 @@ class PixelStackPPOOption(OptionPolicy):
         cfg: OptionConfig,
         model,
         n_stack: int = 4,
+        deterministic: bool = True,
     ):
         super().__init__(subgoal, cfg)
-        self.model  = model
-        self.n_stack = int(n_stack)
+        self.model        = model
+        self.n_stack      = int(n_stack)
+        self.deterministic = bool(deterministic)
         self._buf: Optional[np.ndarray] = None  # (H, W, C * n_stack) uint8
 
     def reset_stack(self):
@@ -77,7 +79,7 @@ class PixelStackPPOOption(OptionPolicy):
     def act(self, obs: Any) -> int:
         frame = _unwrap_pixel(obs)
         self._push(frame)
-        action, _ = self.model.predict(self._buf, deterministic=True)
+        action, _ = self.model.predict(self._buf, deterministic=self.deterministic)
         # predict() returns scalar or 1-d array depending on context
         return int(action) if np.ndim(action) == 0 else int(action.flat[0])
 
@@ -91,14 +93,18 @@ class PixelStackPPOOption(OptionPolicy):
 
         x_t   = evgs.extract(obs)
         steps = 0
-        success   = False
+        success    = False
         trajectory = []
+        step_pairs: list = []   # per-step (x_t, x_tp1) for PCG buffer enrichment
 
         while steps < self.cfg.max_steps:
             action = self.act(obs)
             next_obs, _rew, done, info = env.step(action)
             x_tp1     = evgs.extract(next_obs)
             succ_this = EVGS.predicate_holds(x_t, x_tp1, self.subgoal)
+            # Record every step where EVGS state changes (informative transitions)
+            if np.any(x_tp1 != x_t):
+                step_pairs.append((x_t.copy(), x_tp1.copy()))
             trajectory.append((obs, action, next_obs, succ_this))
             obs = next_obs
             steps += 1
@@ -112,10 +118,11 @@ class PixelStackPPOOption(OptionPolicy):
             x_t = x_tp1
 
         return {
-            "success":   success,
-            "steps":     steps,
+            "success":    success,
+            "steps":      steps,
             "trajectory": trajectory,
-            "final_obs": obs,
+            "final_obs":  obs,
+            "step_pairs": step_pairs,   # informative per-step EVGS transitions
         }
 
 

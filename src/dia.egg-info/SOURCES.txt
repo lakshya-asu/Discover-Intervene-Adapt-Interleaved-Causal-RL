@@ -10,11 +10,14 @@ src/dia/evgs_causalworld.py
 src/dia/evgs_minecraft.py
 src/dia/evgs_montezuma.py
 src/dia/evgs_procgen.py
+src/dia/interventional_pcg.py
 src/dia/intrinsic.py
 src/dia/logging_utils.py
 src/dia/options.py
+src/dia/options_coinrun.py
 src/dia/options_minecraft.py
 src/dia/pcg.py
+src/dia/pcg_granger.py
 src/dia/pcg_learner.py
 src/dia/pcg_variational.py
 src/dia/plan_search.py

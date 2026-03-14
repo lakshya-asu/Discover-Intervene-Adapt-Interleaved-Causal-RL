@@ -1,0 +1,53 @@
+DIA Granger-Causal Montezuma Run Summary
+==================================================
+
+Steps:     400
+Goal:      has_key
+Achieved:  ['near_rope', 'at_door_zone', 'skull_near']
+
+Final PCG entropy: 36.738
+
+Skill success counts:
+  has_key            0
+  door_open          0
+  at_key_zone        0
+  at_door_zone       1
+  on_upper_level     0
+  near_rope          2
+  skull_near         1
+  score_gained       0
+
+Top edges (P > 0.55):
+  door_open → at_door_zone: 0.980
+  at_door_zone → near_rope: 0.747
+  near_rope → skull_near: 0.730
+  at_door_zone → skull_near: 0.674
+  at_door_zone → door_open: 0.650
+  near_rope → on_upper_level: 0.644
+  skull_near → on_upper_level: 0.631
+  at_door_zone → score_gained: 0.620
+  at_door_zone → has_key: 0.620
+  at_key_zone → on_upper_level: 0.609
+  at_key_zone → near_rope: 0.609
+  at_door_zone → at_key_zone: 0.607
+  near_rope → door_open: 0.601
+  at_door_zone → on_upper_level: 0.597
+  score_gained → has_key: 0.596
+
+SIG prerequisites:
+  has_key → door_open
+  has_key → at_key_zone
+  has_key → skull_near
+  has_key → score_gained
+  door_open → at_door_zone
+  at_door_zone → near_rope
+  near_rope → skull_near
+  score_gained → has_key
+  score_gained → door_open
+  score_gained → skull_near
+
+VLM API usage:
+  total_vlm_calls: 0.0
+  total_attempts: 324.0
+  avg_latency_ms: 0.0
+  error_rate: 1.0
