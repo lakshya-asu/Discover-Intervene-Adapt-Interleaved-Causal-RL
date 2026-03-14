@@ -53,8 +53,8 @@ import numpy as np
 
 from dia.evgs_minerl import make_minerl_evgs, VAR_NAMES, inventory_summary
 from dia.options_minerl import (MineRLObsWrapper, MineRLPPOOption,
-                                RandomMineRLOption, load_skill_option,
-                                make_random_option)
+                                RandomMineRLOption, SkillScriptedOption,
+                                load_skill_option, make_random_option)
 from dia.sig import SIGraph, Skill
 from dia.types import Subgoal, Predicate
 from dia.options import OptionConfig
@@ -119,12 +119,15 @@ def _model_path(model_dir: str, var_name: str) -> str:
 
 
 def load_options(model_dir: str, sig: SIGraph,
-                 max_steps: int = 2000, deterministic: bool = True) -> dict:
+                 max_steps: int = 2000, deterministic: bool = True,
+                 use_scripted_fallback: bool = True) -> dict:
     """
     Load PPO skill options from model_dir.
-    Falls back to RandomMineRLOption if no model file found.
 
-    Returns dict: var_idx → option (MineRLPPOOption or RandomMineRLOption).
+    Falls back to SkillScriptedOption (task-specific macro behaviors) when no
+    trained model exists. Use use_scripted_fallback=False for pure random.
+
+    Returns dict: var_idx → option (MineRLPPOOption or SkillScriptedOption).
     """
     options = {}
     for var_idx, var_name in enumerate(VAR_NAMES):
@@ -134,6 +137,9 @@ def load_options(model_dir: str, sig: SIGraph,
         if os.path.exists(path):
             print(f"  [{var_name}] loading PPO model: {path}")
             opt = MineRLPPOOption(sg, cfg, path, deterministic=deterministic)
+        elif use_scripted_fallback:
+            print(f"  [{var_name}] no model found → using SkillScriptedOption (macro)")
+            opt = SkillScriptedOption(sg, cfg, var_name)
         else:
             print(f"  [{var_name}] no model found → using RandomMineRLOption")
             opt = RandomMineRLOption(sg, cfg)
@@ -225,6 +231,8 @@ def main():
     ap.add_argument("--out",               type=str, default="transfer_minecraft3d.mp4")
     ap.add_argument("--fps",               type=int, default=20)
     ap.add_argument("--deterministic",     action="store_true", default=True)
+    ap.add_argument("--random_fallback",   action="store_true", default=False,
+                    help="Use random actions as fallback instead of scripted macros")
     args = ap.parse_args()
 
     if not GYM_OK:
@@ -250,7 +258,8 @@ def main():
     print(f"\nLoading skill options from {args.model_dir}/ ...")
     options = load_options(args.model_dir, sig,
                            max_steps=args.max_steps_per_skill,
-                           deterministic=args.deterministic)
+                           deterministic=args.deterministic,
+                           use_scripted_fallback=not args.random_fallback)
 
     # ── Execution plan: topological order from 2D SIG ─────────────────────────
     topo_order  = sig.toposort()

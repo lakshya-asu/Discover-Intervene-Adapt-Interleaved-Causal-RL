@@ -55,12 +55,20 @@ VAR_NAMES = ["wood", "stone", "coal", "ironore", "furnace",
 _MINERL_ENV_ID = "MineRLObtainDiamondShovel-v0"
 
 
-def make_env(var_name: str, seed: int = 0):
-    """Create a wrapped MineRL env for training skill_{var_name}."""
+def make_env(var_name: str, seed: int = 0, explore_bias: float = 0.0):
+    """Create a wrapped MineRL env for training skill_{var_name}.
+
+    Args:
+        explore_bias: probability (0–1) of sampling from skill-preferred actions
+            during rollout collection. 0 = uniform random (SB3 default).
+            ~0.7 is recommended: makes PPO see reward signals much sooner.
+    """
     import gym
     import minerl  # noqa: registers envs
     from dia.evgs_minerl import make_minerl_evgs
-    from dia.options_minerl import MineRLObsWrapper, ItemRewardWrapper
+    from dia.options_minerl import (MineRLObsWrapper, ItemRewardWrapper,
+                                    BiasedDiscrete, SKILL_PREFERRED_ACTIONS,
+                                    N_ACTIONS)
 
     var_idx = VAR_NAMES.index(var_name)
     evgs    = make_minerl_evgs()
@@ -70,6 +78,16 @@ def make_env(var_name: str, seed: int = 0):
 
     env = MineRLObsWrapper(raw_env, evgs)
     env = ItemRewardWrapper(env, target_var_idx=var_idx)
+
+    # Bias action sampling toward skill-relevant actions during rollout collection.
+    # This does NOT restrict the model's output — PPO still learns over all N_ACTIONS.
+    # It only makes env.action_space.sample() (used by SB3 during exploration) hit
+    # useful actions more often, so reward signal appears earlier in training.
+    if explore_bias > 0 and BiasedDiscrete is not None:
+        preferred = SKILL_PREFERRED_ACTIONS.get(var_name, list(range(N_ACTIONS)))
+        env.action_space = BiasedDiscrete(N_ACTIONS, preferred, bias_prob=explore_bias)
+        print(f"  [explore_bias={explore_bias:.2f}] preferred actions for {var_name}: {preferred}")
+
     return env
 
 
@@ -82,9 +100,13 @@ def main():
                     help="Total env steps (0 = use recommended default)")
     ap.add_argument("--outdir", type=str, default="models/minerl",
                     help="Output directory for saved skill")
-    ap.add_argument("--seed",   type=int, default=42)
-    ap.add_argument("--device", type=str, default="auto",
+    ap.add_argument("--seed",         type=int,   default=42)
+    ap.add_argument("--device",       type=str,   default="auto",
                     help="'cpu', 'cuda', or 'auto'")
+    ap.add_argument("--explore_bias", type=float, default=0.7,
+                    help="Probability of sampling skill-preferred actions during "
+                         "PPO rollout collection (0=uniform random, 0.7=recommended). "
+                         "Makes PPO see reward much sooner on hard-exploration tasks.")
     args = ap.parse_args()
 
     n_steps = args.steps if args.steps > 0 else _RECOMMENDED.get(args.var, 500_000)
@@ -92,13 +114,14 @@ def main():
     os.makedirs(args.outdir, exist_ok=True)
 
     print(f"Training PPO skill for variable: {args.var}")
-    print(f"  env:      {_MINERL_ENV_ID}")
-    print(f"  steps:    {n_steps:,}")
-    print(f"  output:   {out_path}")
-    print(f"  device:   {args.device}")
+    print(f"  env:          {_MINERL_ENV_ID}")
+    print(f"  steps:        {n_steps:,}")
+    print(f"  output:       {out_path}")
+    print(f"  device:       {args.device}")
+    print(f"  explore_bias: {args.explore_bias:.2f}  (fraction of rollout steps using skill-preferred actions)")
 
     # ── Build env ─────────────────────────────────────────────────────────────
-    env = make_env(args.var, seed=args.seed)
+    env = make_env(args.var, seed=args.seed, explore_bias=args.explore_bias)
 
     # ── Train PPO ─────────────────────────────────────────────────────────────
     from stable_baselines3 import PPO

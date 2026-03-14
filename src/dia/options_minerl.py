@@ -58,7 +58,7 @@ INV_DIM = 9     # DIA variable vector length
 
 # ── Discrete action set for MineRL ────────────────────────────────────────────
 # Maps index → (action_key_changes, camera_delta)
-# camera: [pitch_delta, yaw_delta] in degrees
+# camera: [pitch_delta, yaw_delta] in degrees (positive pitch = look down)
 _NOOP: Dict[str, Any] = {
     "attack": 0, "back": 0, "forward": 0, "jump": 0,
     "left": 0, "right": 0, "sneak": 0, "sprint": 0, "use": 0,
@@ -71,23 +71,51 @@ _NOOP: Dict[str, Any] = {
 
 # Each entry: list of (key, value) overrides on top of _NOOP
 _ACTION_DEFS = [
-    [],                                          # 0: noop
-    [("forward", 1)],                            # 1: forward
-    [("back", 1)],                               # 2: back
-    [("left", 1)],                               # 3: strafe left
-    [("right", 1)],                              # 4: strafe right
-    [("jump", 1)],                               # 5: jump
-    [("attack", 1)],                             # 6: attack (mine/chop)
-    [("use", 1)],                                # 7: use (place/craft/open)
-    [("forward", 1), ("attack", 1)],             # 8: forward + attack
-    [("forward", 1), ("jump", 1)],               # 9: forward + jump
-    [("forward", 1), ("sprint", 1)],             # 10: sprint forward
-    [("camera", np.array([-15.0, 0.0]))],        # 11: camera up
-    [("camera", np.array([15.0, 0.0]))],         # 12: camera down
-    [("camera", np.array([0.0, -15.0]))],        # 13: camera left
-    [("camera", np.array([0.0, 15.0]))],         # 14: camera right
+    [],                                                          # 0:  noop
+    [("forward", 1)],                                            # 1:  forward
+    [("back", 1)],                                               # 2:  back
+    [("left", 1)],                                               # 3:  strafe left
+    [("right", 1)],                                              # 4:  strafe right
+    [("jump", 1)],                                               # 5:  jump
+    [("attack", 1)],                                             # 6:  attack (mine/chop)
+    [("use", 1)],                                                # 7:  use (place/craft/open)
+    [("forward", 1), ("attack", 1)],                             # 8:  forward + attack
+    [("forward", 1), ("jump", 1)],                               # 9:  forward + jump
+    [("forward", 1), ("sprint", 1)],                             # 10: sprint forward
+    [("camera", np.array([-15.0, 0.0]))],                        # 11: camera up  (coarse)
+    [("camera", np.array([15.0, 0.0]))],                         # 12: camera down (coarse)
+    [("camera", np.array([0.0, -15.0]))],                        # 13: camera left (coarse)
+    [("camera", np.array([0.0, 15.0]))],                         # 14: camera right (coarse)
+    # ── additional actions for effective 3D skill execution ──────────────────
+    [("forward", 1), ("sprint", 1), ("attack", 1)],              # 15: sprint + attack (aggressive)
+    [("camera", np.array([-5.0, 0.0]))],                         # 16: camera up   (fine)
+    [("camera", np.array([5.0, 0.0]))],                          # 17: camera down  (fine)
+    [("camera", np.array([0.0, -5.0]))],                         # 18: camera left  (fine)
+    [("camera", np.array([0.0, 5.0]))],                          # 19: camera right (fine)
+    [("hotbar.1", 1)],                                           # 20: equip slot 1
+    [("hotbar.2", 1)],                                           # 21: equip slot 2
+    [("forward", 1), ("use", 1)],                                # 22: forward + use (walk + interact)
+    [("jump", 1), ("attack", 1)],                                # 23: jump + attack
+    [("forward", 1), ("jump", 1), ("attack", 1)],                # 24: forward + jump + attack
 ]
 N_ACTIONS = len(_ACTION_DEFS)
+
+# ── Per-skill preferred action indices for biased PPO exploration ─────────────
+# Actions most likely to produce reward signal for each skill.
+# Used by BiasedDiscrete to make rollout collection more sample-efficient.
+SKILL_PREFERRED_ACTIONS: Dict[str, List[int]] = {
+    # Gathering skills: physical actions dominate
+    "wood":        [6, 8, 11, 15, 24, 9, 14, 13, 16, 17],  # attack, fwd+attack, look up, sprint+atk
+    "stone":       [6, 12, 17, 8, 1, 11, 16, 14, 13],       # attack, look down, fwd+attack
+    "coal":        [6, 8, 11, 14, 13, 9, 15, 16, 17, 1],    # attack + exploration
+    "ironore":     [6, 8, 12, 17, 14, 13, 9, 15, 24, 1],    # attack + look down + exploration
+    "diamond":     [6, 8, 12, 17, 14, 13, 9, 15, 24, 1],    # same as ironore (mine deep)
+    # Crafting/smelting skills: interaction actions dominate
+    "furnace":     [7, 6, 12, 17, 11, 16, 1, 22, 20, 21],   # use, look down, interact
+    "stonepickaxe":[7, 6, 12, 17, 11, 16, 22, 20, 21, 1],   # same as furnace
+    "iron":        [7, 12, 17, 11, 16, 6, 22, 1, 20, 21],   # use (smelt), look down
+    "ironpickaxe": [7, 6, 12, 17, 11, 16, 22, 20, 21, 1],   # same as furnace
+}
 
 
 def idx_to_minerl_action(idx: int) -> Dict[str, Any]:
@@ -329,6 +357,245 @@ class RandomMineRLOption(OptionPolicy):
 
         return {"success": success, "steps": steps,
                 "trajectory": trajectory, "final_obs": obs}
+
+
+# ---------------------------------------------------------------------------
+# SkillScriptedOption — task-specific macro behaviors (much better than random)
+# ---------------------------------------------------------------------------
+
+class SkillScriptedOption(OptionPolicy):
+    """
+    Scripted option that cycles a task-specific action macro.
+
+    Each skill has a handcrafted macro sequence designed around the physical
+    actions needed to acquire that resource in 3D Minecraft:
+      - Gathering skills (wood/stone/coal/ironore/diamond): navigation + attack
+      - Crafting/smelting skills: interaction attempts via use/inventory
+
+    The macro is cycled indefinitely (looped) until success or max_steps.
+    A small random perturbation is added to camera at each step to avoid
+    getting stuck looking at the same spot.
+    """
+
+    # Action macro sequences per skill (indices into _ACTION_DEFS)
+    # Legend (key actions): 6=attack, 8=fwd+attack, 11=cam_up, 12=cam_down,
+    #   13=cam_left, 14=cam_right, 15=sprint+attack, 24=fwd+jump+attack,
+    #   7=use, 16=cam_up_fine, 17=cam_down_fine, 9=fwd+jump
+    _MACROS: Dict[str, List[int]] = {
+        # WOOD: approach tree trunk, look up to hit trunk, chop continuously.
+        # Trees are 2-4 blocks tall; look slightly up, sprint+attack while walking.
+        "wood": [
+            11, 11,                    # look up (tree trunk is above ground level)
+            8, 8, 8, 8, 8,             # forward + attack (walk into tree)
+            6, 6, 6, 6, 6, 6,          # attack in place (break trunk block)
+            15,                        # sprint forward (close gap)
+            8, 8, 8, 8,                # forward + attack
+            9,                         # jump forward (obstacle)
+            11,                        # look up a bit more (top of trunk)
+            6, 6, 6, 6, 6,             # attack
+            14, 14, 14,                # turn right (find another tree)
+            8, 8, 8,                   # approach
+            13, 13, 13, 13,            # turn left (zig-zag search)
+            8, 8, 8, 8, 8,             # forward + attack
+            24,                        # fwd + jump + attack
+        ],
+        # STONE: mine cobblestone. Stone is at ground level / in walls.
+        # Look down to aim at ground stone, attack repeatedly.
+        "stone": [
+            12, 12,                    # look down (aim at ground block)
+            6, 6, 6, 6, 6, 6, 6, 6,   # attack x8 (mine cobblestone)
+            11,                        # look up a bit
+            1,                         # step forward (new block)
+            12,                        # look down
+            6, 6, 6, 6, 6, 6,          # attack x6
+            11, 11,                    # look forward
+            14, 14,                    # turn right (try cliff face)
+            12, 12,                    # look down
+            6, 6, 6, 6, 6,             # attack
+            11, 11,                    # look forward
+            8, 8,                      # move forward
+        ],
+        # COAL: find coal ore in stone walls / cave entrances.
+        # Walk forward attacking rock faces; turn to search.
+        "coal": [
+            11,                        # look up slightly (coal often in walls at eye height)
+            8, 8, 8, 8, 8,             # forward + attack
+            6, 6, 6, 6,                # attack wall
+            14, 14,                    # turn right
+            8, 8, 8,                   # forward + attack
+            13, 13, 13, 13,            # turn left
+            8, 8, 8, 8,                # forward + attack
+            6, 6, 6, 6,                # attack
+            9,                         # jump + forward
+            14, 14, 14,                # turn right (search)
+            6, 6, 6, 6, 6,             # attack
+        ],
+        # IRONORE: iron ore is underground (y=15-63). Same search pattern.
+        "ironore": [
+            8, 8, 8, 8, 8,             # forward + attack (cave)
+            12, 12,                    # look down slightly (deeper ore)
+            6, 6, 6, 6, 6, 6,          # attack
+            11, 11,                    # look forward
+            14, 14,                    # turn right
+            8, 8, 8,                   # forward + attack
+            13, 13, 13,                # turn left
+            6, 6, 6, 6,                # attack
+            9,                         # jump
+            15,                        # sprint + attack
+            12,                        # look down
+            6, 6, 6, 6, 6,             # attack
+            11,                        # look up
+        ],
+        # FURNACE: craft from 8 cobblestone at crafting table.
+        # Can't script GUI crafting — try use + inventory interactions.
+        "furnace": [
+            7, 7, 7,                   # use (right-click: open crafting table/interact)
+            12,                        # look down
+            7, 7,                      # use
+            11,                        # look up
+            6, 6,                      # attack (break any block in the way)
+            14,                        # turn right
+            7, 7, 7,                   # use
+            1,                         # forward
+            7, 7,                      # use
+            12,                        # look down
+            7, 7,                      # use
+            11,                        # look up
+            8, 8,                      # forward + attack
+        ],
+        # STONEPICKAXE: craft from sticks + cobblestone.
+        "stonepickaxe": [
+            7, 7, 7, 7,                # use repeatedly (crafting attempt)
+            12,                        # look down
+            7, 7,                      # use
+            11,                        # look up
+            7, 7,                      # use
+            14, 14,                    # turn
+            7, 7, 7,                   # use
+            22,                        # forward + use (walk to crafting table)
+            7, 7,                      # use
+        ],
+        # IRON: smelt iron ore in furnace. Need use near furnace.
+        "iron": [
+            7, 7, 7, 7, 7,             # use (interact with furnace)
+            12,                        # look down
+            7, 7, 7,                   # use
+            11,                        # look up
+            7, 7,                      # use
+            6,                         # attack
+            22,                        # forward + use
+            7, 7, 7,                   # use
+        ],
+        # IRONPICKAXE: craft from iron ingots + sticks.
+        "ironpickaxe": [
+            7, 7, 7, 7,                # use
+            12,                        # look down
+            7, 7,                      # use
+            11,                        # look up
+            7, 7, 7,                   # use
+            14, 14,                    # turn
+            7, 7, 7,                   # use
+            22,                        # forward + use
+            7, 7,                      # use
+        ],
+        # DIAMOND: mine diamond ore with iron pickaxe (y=5-12).
+        # Same as ironore: walk + attack walls at lower levels.
+        "diamond": [
+            12, 12,                    # look down (go deeper)
+            6, 6, 6, 6, 6, 6, 6,       # attack (dig down)
+            11, 11,                    # look forward
+            8, 8, 8, 8,                # forward + attack
+            12,                        # look down
+            6, 6, 6, 6, 6, 6,          # attack (mine wall)
+            11,                        # look up
+            14, 14,                    # turn right
+            8, 8, 8,                   # forward + attack
+            13, 13,                    # turn left
+            6, 6, 6, 6, 6,             # attack
+            9,                         # jump
+        ],
+    }
+    _DEFAULT_MACRO = [8, 8, 8, 8, 6, 6, 6, 6, 14, 14, 6, 6, 13, 13, 9]
+
+    def __init__(self, subgoal: Subgoal, cfg: OptionConfig, var_name: str,
+                 noise_prob: float = 0.1):
+        """
+        Args:
+            var_name:   DIA variable name ('wood', 'stone', etc.)
+            noise_prob: probability of replacing a macro step with a random action
+                        (adds exploration so the agent doesn't get stuck in loops)
+        """
+        super().__init__(subgoal, cfg)
+        self.var_name   = var_name
+        self.noise_prob = noise_prob
+        self._macro     = self._MACROS.get(var_name, self._DEFAULT_MACRO)
+        self._step      = 0
+
+    def act(self, obs) -> int:
+        if self.noise_prob > 0 and np.random.random() < self.noise_prob:
+            # Small exploration: random camera tweak or movement
+            return int(np.random.choice([0, 1, 5, 13, 14, 16, 17, 18, 19]))
+        idx = self._macro[self._step % len(self._macro)]
+        self._step += 1
+        return int(idx)
+
+    def run(self, env, evgs: EVGS) -> Dict[str, Any]:
+        obs     = env.get_obs() if hasattr(env, "get_obs") else {}
+        self._step = 0
+        steps   = 0
+        success = False
+        trajectory: list = []
+
+        while steps < self.cfg.max_steps:
+            action                    = self.act(obs)
+            next_obs, _rew, done, _info = env.step(action)
+
+            x_curr = evgs.extract(obs)
+            x_next = evgs.extract(next_obs)
+            succ   = EVGS.predicate_holds(x_curr, x_next, self.subgoal)
+            trajectory.append((obs, action, next_obs, succ))
+            obs    = next_obs
+            steps += 1
+
+            if succ:
+                success = True
+                if self.cfg.terminate_on_success:
+                    break
+            if done:
+                break
+
+        return {"success": success, "steps": steps,
+                "trajectory": trajectory, "final_obs": obs}
+
+
+# ---------------------------------------------------------------------------
+# BiasedDiscrete — Discrete space that biases sample() toward useful actions.
+# Used during PPO training so rollout collection hits reward more often.
+# ---------------------------------------------------------------------------
+
+if GYM_OK and spaces is not None:
+    class BiasedDiscrete(spaces.Discrete):
+        """
+        Discrete(N) action space whose sample() returns preferred actions
+        with probability `bias_prob`, falling back to uniform otherwise.
+
+        This is used in train_minerl_skill.py: when SB3 PPO calls
+        env.action_space.sample() during rollout collection (exploration),
+        it preferentially samples skill-appropriate actions, making early
+        reward signals much more likely.
+        """
+        def __init__(self, n: int, preferred: List[int], bias_prob: float = 0.7):
+            super().__init__(n)
+            self.preferred  = [int(a) for a in preferred if 0 <= int(a) < n]
+            self.bias_prob  = float(bias_prob)
+
+        def sample(self, mask=None) -> int:  # type: ignore[override]
+            if self.preferred and np.random.random() < self.bias_prob:
+                return int(np.random.choice(self.preferred))
+            return int(super().sample(mask=mask) if mask is not None
+                       else super().sample())
+else:
+    BiasedDiscrete = None  # type: ignore
 
 
 # ---------------------------------------------------------------------------
