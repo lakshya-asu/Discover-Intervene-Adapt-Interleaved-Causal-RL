@@ -27,15 +27,21 @@ class InterventionSelector:
     - If a task_goal is provided, use GoalPlanner to get an ordered plan and pick the first 'ready' skill.
     - Else use a novelty -> confirmatory -> goal-directed heuristic based on PCG entropy and skill stats.
     """
-    def __init__(self, pcg: SimplePCG, sig: SIGraph, cfg: PlannerConfig):
+    def __init__(self, pcg: SimplePCG, sig: SIGraph, cfg: PlannerConfig,
+                 use_ig_bonus: bool = True, use_sig: bool = True):
         self.pcg = pcg
         self.sig = sig
         self.cfg = cfg
+        self.use_ig_bonus = use_ig_bonus  # False => skip novelty/entropy phase
+        self.use_sig = use_sig            # False => ignore SIG prerequisites
         self.beta_sched = BetaScheduler(beta_max=1.0, beta_min=0.0, h_ref=cfg.entropy_high)
         self.goal_planner = GoalPlanner(sig)
 
     def phase(self) -> str:
         H = self.pcg.entropy()
+        if not self.use_ig_bonus:
+            # No IG-based novelty seeking; collapse to confirm or goal only.
+            return "goal" if H <= self.cfg.entropy_low else "confirm"
         if H >= self.cfg.entropy_high:
             return "novel"
         if H <= self.cfg.entropy_low:
@@ -68,8 +74,11 @@ class InterventionSelector:
 
     def _select_non_goal(self, achieved: List[int], task_goal: Optional[Subgoal]) -> int:
         phase = self.phase()
-        candidates = self.sig.ready_skills(achieved)
-        if not candidates:
+        if self.use_sig:
+            candidates = self.sig.ready_skills(achieved)
+            if not candidates:
+                candidates = list(self.sig.skills.keys())
+        else:
             candidates = list(self.sig.skills.keys())
         skills = [self.sig.skills[c] for c in candidates]
 
@@ -80,15 +89,29 @@ class InterventionSelector:
         else:
             scores = [self.score_goal(s, task_goal) for s in skills]
 
-        best_idx = int(np.argmax(scores))
+        scores_arr = np.array(scores, dtype=float)
+        exp_s = np.exp(scores_arr - scores_arr.max())
+        probs_s = exp_s / exp_s.sum()
+        best_idx = int(np.random.choice(len(skills), p=probs_s))
         return skills[best_idx].skill_id
 
     def select(self, achieved: List[int], task_goal: Optional[Subgoal] = None) -> int:
         """
-        If task_goal is provided and corresponds to a known skill, return the first 'ready'
-        skill in its prerequisite plan. Otherwise fallback to non-goal selection.
+        Select the next skill to execute.
+
+        Goal plan is only activated in "goal" phase (low entropy = confident causal model).
+        In "novel" / "confirm" phases, falls through to _select_non_goal() so that DIA
+        explores broadly to BUILD the causal model first.
+
+        Rationale: with an empty SIG at initialisation, plan_for_subgoal returns [target]
+        (no prerequisites), so the goal plan would always pick the target skill directly.
+        That collapses exploration to a single skill that never succeeds, giving
+        success_rate ≈ 0 and SHD stuck at the initial value.  By gating on phase="goal"
+        we ensure goal-directed execution only kicks in AFTER the PCG has been learned.
+
+        When use_sig=False, SIG prerequisite filtering is bypassed entirely.
         """
-        if task_goal is not None:
+        if task_goal is not None and self.use_sig and self.phase() == "goal":
             plan = self.goal_planner.plan_for_subgoal(task_goal, achieved)
             if plan is not None and plan.skills:
                 # pick first ready skill from the plan
@@ -96,5 +119,5 @@ class InterventionSelector:
                 for sid in plan.skills:
                     if sid in ready:
                         return sid
-        # fallback
+        # fallback (also handles novel/confirm phases)
         return self._select_non_goal(achieved, task_goal)

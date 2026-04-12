@@ -1,1 +1,74 @@
+# Worktrees
 .worktrees/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Large binary / runtime artifacts
+*.zip
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.npy
+*.mp4
+*.avi
+*.pkl
+*.pkl.gz
+
+# Experiment outputs (large)
+data/
+models/
+runs/
+results/
+
+# Logs
+logs/
+
+# Paper LaTeX build artifacts
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.log
+paper/*.out
+paper/*.synctex.gz
+paper/*.fls
+paper/*.fdb_latexmk
+paper/_minted-*/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Claude Code session data
+.claude/
+
+# Runtime state
+sig_2d.json
+pcg_2d.npy
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# pytest
+.pytest_cache/
+pytest.ini
+conftest.py

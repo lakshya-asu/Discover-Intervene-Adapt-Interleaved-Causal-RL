@@ -355,6 +355,9 @@ def main():
                          "edges to the SIG. Use for demos when PCG signal is too weak "
                          "to cross the threshold alone (observational dilution in count envs). "
                          "PCG learning still runs; this just ensures a valid plan is exported.")
+    ap.add_argument("--cwm_buf_out",        type=str,   default="cwm_buffer_2d.npy",
+                    help="Output file for CWM training buffer (x_t, skill_idx, x_tp1). "
+                         "Used by scripts/pretrain_cwm.py for offline CWM training.")
     args = ap.parse_args()
 
     # ── env + EVGS ────────────────────────────────────────────────────────────
@@ -396,6 +399,12 @@ def main():
     # ── Transition buffer ─────────────────────────────────────────────────────
     buffer: list = []   # list of (x_t, x_tp1) from ALL primitive steps in all options
     MAX_BUFFER = 5_000
+
+    # ── CWM training buffer ───────────────────────────────────────────────────
+    # Stores (x_t, skill_idx, x_tp1) for offline CWM pre-training.
+    # Richer than the PCG buffer: records WHICH skill was running for each transition.
+    cwm_buffer: list = []  # list of (x_t np.ndarray, skill_idx int, x_tp1 np.ndarray)
+    MAX_CWM_BUFFER = 20_000
 
     # ── State ─────────────────────────────────────────────────────────────────
     obs       = env.reset()
@@ -445,9 +454,13 @@ def main():
             xtp1 = evgs.extract(obs_tp1)
             if not np.allclose(xt, xtp1):   # only store actual changes
                 buffer.append((xt, xtp1))
-        # Trim buffer
+                # CWM buffer: also record which skill was executing
+                cwm_buffer.append((xt, var_k, xtp1))
+        # Trim buffers
         if len(buffer) > MAX_BUFFER:
             buffer = buffer[-MAX_BUFFER:]
+        if len(cwm_buffer) > MAX_CWM_BUFFER:
+            cwm_buffer = cwm_buffer[-MAX_CWM_BUFFER:]
 
         # ── Refit PCG from buffer ─────────────────────────────────────────
         if len(buffer) >= args.min_buffer and (t + 1) % args.fit_every == 0:
@@ -546,6 +559,18 @@ def main():
     # ── Save PCG probs ────────────────────────────────────────────────────────
     np.save(args.pcg_out, pcg.probs.astype(np.float32))
     print(f"\nSaved PCG probs: {args.pcg_out}  shape={pcg.probs.shape}")
+
+    # ── Save CWM training buffer ──────────────────────────────────────────────
+    # Format: structured array with fields x_t [M], skill_idx [1], x_tp1 [M]
+    # Used by scripts/pretrain_cwm.py for offline CWM pre-training.
+    if cwm_buffer and args.cwm_buf_out:
+        xs   = np.stack([t[0] for t in cwm_buffer]).astype(np.float32)  # (N, M)
+        ks   = np.array([t[1] for t in cwm_buffer], dtype=np.int32)     # (N,)
+        xps  = np.stack([t[2] for t in cwm_buffer]).astype(np.float32)  # (N, M)
+        np.savez(args.cwm_buf_out.replace(".npy", "") if args.cwm_buf_out.endswith(".npy")
+                 else args.cwm_buf_out,
+                 x_t=xs, skill_idx=ks, x_tp1=xps)
+        print(f"Saved CWM buffer: {args.cwm_buf_out}  ({len(cwm_buffer)} transitions)")
 
     # ── Save SIG edges ────────────────────────────────────────────────────────
     edges_list_final = []

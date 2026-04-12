@@ -151,41 +151,67 @@ class DIARunner:
         return float(np.sum(kl))
 
     @staticmethod
-    def _transition_fit_probs(X_t: np.ndarray, X_tp1: np.ndarray,
-                               alpha: float = 5.0) -> np.ndarray:
+    def _interventional_fit_probs(X_t: np.ndarray, X_tp1: np.ndarray,
+                                   mask: np.ndarray, alpha: float = 5.0) -> np.ndarray:
         """
-        Bayesian causal-edge estimation from binary state transitions.
+        Interventional causal-edge estimation using the skill execution mask.
 
-        For each directed edge (i → j) the question is:
-          "Does X_t[i]=1 predict X_tp1[j] increasing, compared to X_t[i]=0?"
+        For edge (i -> j) the question is:
+          "When skill j was executed (do(j)), did having i already done help j succeed?"
 
-        Uses Beta posterior with a symmetric prior of strength `alpha` so that
-        the estimate starts at 0.5 (no evidence) and converges as data accumulates.
+        Only transitions where skill j was the intervened variable (mask[:, j] = 1) are
+        used to estimate edge i -> j.  This isolates the interventional signal:
+          P(j↑ | do(j), i=1 at t)  vs  P(j↑ | do(j), i=0 at t)
 
-        Returns a [d, d] matrix of edge probabilities (diagonal is 0).
+        In a prerequisite chain this cleanly recovers the structure:
+          - ironpickaxe -> diamond: diamond only increases when ironpickaxe >= 1
+          - observational correlations between non-adjacent variables are suppressed
+
+        Returns NaN for edges with insufficient data so callers can preserve
+        the old PCG probability for those edges rather than overwriting with 0.5.
+        Only edges with sufficient interventional evidence get a real estimate.
+
+        Returns a [d, d] matrix: estimated edge probabilities where observed,
+        NaN where there is insufficient data (diagonal is 0).
         """
         if X_t.shape[0] == 0:
             d = X_t.shape[1] if X_t.ndim > 1 else 1
-            return np.full((d, d), 0.5)
+            return np.full((d, d), np.nan)
 
         N, d = X_t.shape
-        probs = np.full((d, d), 0.5, dtype=float)
+        probs = np.full((d, d), np.nan, dtype=float)
+        min_samples = 3
 
         for j in range(d):
-            j_up = (X_tp1[:, j] > X_t[:, j]).astype(float)   # 1 when var j increases
+            # Only use transitions where skill j was the intervened skill
+            int_idx = (mask[:, j] > 0.5) if mask.ndim == 2 else np.zeros(N, dtype=bool)
+            n_int = int(np.sum(int_idx))
+            if n_int < min_samples:
+                continue
+
+            x_t_j   = X_t[int_idx]
+            x_tp1_j = X_tp1[int_idx]
+            j_up    = (x_tp1_j[:, j] > x_t_j[:, j]).astype(float)  # did j increase?
 
             for i in range(d):
                 if i == j:
                     continue
-                active_i   = (X_t[:, i] > 0.5).astype(float)
+                active_i   = (x_t_j[:, i] > 0.5).astype(float)
                 inactive_i = 1.0 - active_i
 
                 n_active   = float(np.sum(active_i))
                 n_inactive = float(np.sum(inactive_i))
 
-                # Require observations in both groups; without contrast evidence stays 0.5
-                if n_active < 3 or n_inactive < 3:
-                    probs[i, j] = 0.5
+                # Require both sufficient inactive samples AND a minimum balance ratio.
+                # Without this, early training is dominated by n_inactive=2-3 samples
+                # whose Beta posteriors are prior-dominated (alpha=5), causing 40+ FPs
+                # the moment the buffer first fills (step ~260).
+                min_inactive = 15
+                balance_min  = 0.25   # inactive must be ≥ 25% of intervention samples
+                n_total = n_active + n_inactive
+                if (n_active < min_samples or n_inactive < min_inactive
+                        or n_inactive / n_total < balance_min):
+                    # insufficient contrast — leave as NaN (caller keeps old prob)
                     continue
 
                 # Beta posterior: (successes + alpha) / (trials + 2*alpha)
@@ -193,7 +219,7 @@ class DIARunner:
                 p_up_inactive = (float(np.sum(inactive_i * j_up)) + alpha) / (n_inactive + 2 * alpha)
 
                 denom = p_up_active + p_up_inactive
-                probs[i, j] = p_up_active / denom if denom > 1e-10 else 0.5
+                probs[i, j] = p_up_active / denom if denom > 1e-10 else np.nan
 
         np.fill_diagonal(probs, 0.0)
         return probs
@@ -216,11 +242,18 @@ class DIARunner:
         old_probs   = np.array(getattr(self.pcg, "probs")).copy()
         old_entropy = float(getattr(self.pcg, "entropy")()) if hasattr(self.pcg, "entropy") else np.nan
 
-        # ── Causal discovery: frequency-based transition estimation ──────────
-        # Computes P(j↑ | i=1 at t) vs P(j↑ | i=0 at t) for every (i,j) pair.
-        # This is a Bayesian estimate over the TEMPORAL transition X_t → X_{t+1},
-        # which is the correct signal for learning causal ordering of EVGS variables.
-        new_probs = self._transition_fit_probs(X_t_data, X_tp1_data)
+        # ── Causal discovery: interventional edge estimation ─────────────────
+        # For edge (i -> j): only uses transitions where skill j was executed.
+        # Asks "when we tried to achieve j, did having i active help?"
+        # This suppresses observational correlations and recovers prerequisites.
+        # Returns NaN for edges with insufficient data; we preserve old probs there.
+        est_probs = self._interventional_fit_probs(X_t_data, X_tp1_data, mask)
+
+        # Merge: only update edges where we have real signal; keep old probs elsewhere
+        new_probs = old_probs.copy()
+        observed = ~np.isnan(est_probs)
+        new_probs[observed] = est_probs[observed]
+        np.fill_diagonal(new_probs, 0.0)
 
         if hasattr(self.pcg, "apply_update"):
             self.pcg.apply_update(new_probs)
@@ -262,6 +295,18 @@ class DIARunner:
                     self.logger.add_scalar(f"{self.cfg.log_prefix}/sig_created", float(stats["created_skills"]))
 
         return True, ig_update, entropy_drop
+
+    # -------- checkpoint save/load --------
+
+    def save_checkpoint(self, path: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+        """Save PCG + SIG (and lightweight option metadata) to a JSON file."""
+        from .checkpoint import save_checkpoint as _save
+        _save(path, self.pcg, self.sig, self.options, metadata)
+
+    def load_checkpoint(self, path: str) -> Dict[str, Any]:
+        """Restore PCG + SIG state from a JSON checkpoint. Returns the raw dict."""
+        from .checkpoint import load_checkpoint as _load
+        return _load(path, self.pcg, self.sig)
 
     # -------- main step --------
 

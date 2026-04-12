@@ -178,3 +178,7 @@ def inventory_summary(obs: Any) -> str:
     parts  = [f"{VAR_NAMES[i]}={int(counts[i])}" for i in range(len(VAR_NAMES))
               if counts[i] > 0]
     return "  ".join(parts) if parts else "(empty)"
+
+
+# Alias with explicit backend suffix for cross-backend imports
+inventory_summary_minedojo = inventory_summary

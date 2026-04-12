@@ -46,6 +46,7 @@ import argparse
 import json
 import os
 import sys
+from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -58,6 +59,26 @@ from dia.options_minerl import (MineRLObsWrapper, MineRLPPOOption,
 from dia.sig import SIGraph, Skill
 from dia.types import Subgoal, Predicate
 from dia.options import OptionConfig
+from dia.pcg import SimplePCG, PCGConfig
+from dia.intrinsic import BetaScheduler
+
+try:
+    from dia.cwm import CWMConfig, CWMTrainer
+    CWM_OK = True
+except Exception:
+    CWM_OK = False
+
+try:
+    from dia.vlm_minerl import MineRLVLMAnalyzer, MineRLVLMConfig, fuse_with_inventory
+    VLM_OK = True
+except Exception:
+    VLM_OK = False
+
+try:
+    from dia.clip_skill import CLIPGoalEncoder, SKILL_TEXTS
+    CLIP_OK = True
+except Exception:
+    CLIP_OK = False
 
 try:
     import gym
@@ -233,6 +254,27 @@ def main():
     ap.add_argument("--deterministic",     action="store_true", default=True)
     ap.add_argument("--random_fallback",   action="store_true", default=False,
                     help="Use random actions as fallback instead of scripted macros")
+    ap.add_argument("--cwm",               type=str, default="",
+                    help="Path to pre-trained CWM weights (cwm_2d.pt). "
+                         "If provided, enables online PCG adaptation and curiosity logging.")
+    ap.add_argument("--pcg",               type=str, default="pcg_2d.npy",
+                    help="Path to pcg_2d.npy (PCG edge probs from Phase 1). "
+                         "Used to initialise online SimplePCG for CWM-driven pruning.")
+    ap.add_argument("--cwm_online_steps",  type=int, default=4,
+                    help="Gradient steps per skill for online CWM fine-tuning")
+    ap.add_argument("--vlm",               action="store_true", default=False,
+                    help="Enable Claude Opus 4.6 visual consultant. "
+                         "Calls API at skill start and on failure to get visual scan "
+                         "and directive action sequence. Requires ANTHROPIC_API_KEY.")
+    ap.add_argument("--vlm_verbose",       action="store_true", default=False,
+                    help="Print VLM analysis results (reason, directive, latency)")
+    ap.add_argument("--use_clip",          action="store_true", default=False,
+                    help="Load CLIP (ViT-B/32) and inject goal embeddings into PPO options. "
+                         "At skill start, encodes VLM reason text (or default skill text) "
+                         "→ 512-dim vector → option.set_goal_embedding(). Requires that "
+                         "skills were trained with --use_clip.")
+    ap.add_argument("--clip_device",       type=str, default="cpu",
+                    help="Device for CLIP: 'cpu' or 'cuda' (default cpu)")
     args = ap.parse_args()
 
     if not GYM_OK:
@@ -245,6 +287,60 @@ def main():
         print("  Run Phase 1 first:  conda run -n dia python scripts/train_minecraft2d_sip.py")
         return
     sig = load_sig_from_json(args.sig)
+
+    # ── Online PCG (initialised from 2D probs if available) ───────────────────
+    M   = len(VAR_NAMES)
+    pcg = SimplePCG(PCGConfig(num_vars=M, init_edge_prob=0.05))
+    if os.path.exists(args.pcg):
+        probs = np.load(args.pcg).astype(float)
+        np.fill_diagonal(probs, 0.0)
+        pcg.state.edge_probs = np.clip(probs, 0.0, 1.0)
+        print(f"Loaded PCG probs from {args.pcg}")
+    else:
+        print(f"  PCG file not found ({args.pcg}); using uniform init")
+
+    # ── CWM (optional — load pre-trained weights if provided) ────────────────
+    cwm_trainer = None
+    if args.cwm and CWM_OK:
+        cwm_path = args.cwm
+        if os.path.exists(cwm_path):
+            cfg_cwm = CWMConfig(
+                num_vars=M, num_skills=M,
+                online_steps=args.cwm_online_steps,
+            )
+            cwm_trainer = CWMTrainer(cfg_cwm, pcg=pcg)
+            cwm_trainer.load(cwm_path)
+            print(f"Loaded CWM from {cwm_path}")
+        else:
+            print(f"  CWM file not found ({cwm_path}); running without CWM")
+    elif args.cwm and not CWM_OK:
+        print("  WARNING: CWM requested but PyTorch not available — skipping CWM")
+
+    # ── CLIP goal encoder (optional) ──────────────────────────────────────────
+    clip_encoder = None
+    if args.use_clip:
+        if CLIP_OK:
+            clip_encoder = CLIPGoalEncoder.get(device=args.clip_device)
+            print(f"CLIP encoder loaded (ViT-B/32, device={args.clip_device})")
+        else:
+            print("WARNING: --use_clip requested but clip_skill module unavailable "
+                  "(pip install openai-clip)")
+
+    # ── VLM visual consultant (optional) ─────────────────────────────────────
+    vlm_analyzer = None
+    if args.vlm:
+        if VLM_OK:
+            vlm_analyzer = MineRLVLMAnalyzer(
+                MineRLVLMConfig(verbose=args.vlm_verbose),
+                min_interval_s=1.0,
+            )
+            print("VLM consultant enabled (Claude Opus 4.6)")
+        else:
+            print("WARNING: --vlm requested but vlm_minerl module unavailable")
+
+    # PCG entropy scheduler for curiosity scaling
+    _beta_sched = BetaScheduler(beta_max=1.0, beta_min=0.0,
+                                h_ref=M * (M - 1) * 0.693)
 
     # ── MineRL environment ────────────────────────────────────────────────────
     import gym as gym_mod
@@ -294,8 +390,42 @@ def main():
                 achieved.append(skill_id)
             continue
 
+        # ── VLM: visual scan before execution ─────────────────────────────────
+        _vlm_goal_text: Optional[str] = None   # populated by VLM if available
+        if vlm_analyzer is not None:
+            raw_obs = env.get_raw_obs()
+            pov_frame = None
+            if isinstance(raw_obs, dict):
+                pov_frame = raw_obs.get("pov")
+                if pov_frame is None:
+                    pov_frame = raw_obs.get("rgb")
+            if pov_frame is not None:
+                vlm_pre = vlm_analyzer.analyze(
+                    np.asarray(pov_frame, dtype=np.uint8),
+                    var_name=var_name,
+                    context="start",
+                )
+                if not vlm_pre.error:
+                    _vlm_goal_text = vlm_pre.reason  # encode via CLIP below
+                    if vlm_pre.directive_actions:
+                        # Feed directive into SkillScriptedOption if applicable
+                        if isinstance(option, SkillScriptedOption):
+                            option.set_directive(vlm_pre.directive_actions)
+                    if not args.vlm_verbose:
+                        print(f"  [{var_name}] VLM: {vlm_pre.reason[:80]}  "
+                              f"directive={vlm_pre.directive_actions}")
+
+        # ── CLIP: encode goal text → embedding → inject into option ───────────
+        if clip_encoder is not None and hasattr(option, "set_goal_embedding"):
+            # Prefer VLM-generated scene-specific text; fall back to fixed skill text
+            goal_text = _vlm_goal_text or SKILL_TEXTS.get(
+                var_name, f"gathering {var_name} in Minecraft"
+            )
+            goal_embed = clip_encoder.encode_vlm_instruction(goal_text)
+            option.set_goal_embedding(goal_embed)
+
         # ── Run skill ─────────────────────────────────────────────────────────
-        print(f"  [{var_name}] executing PPO skill  (max {args.max_steps_per_skill} steps) ...")
+        print(f"  [{var_name}] executing skill  (max {args.max_steps_per_skill} steps) ...")
         out     = option.run(env, evgs)
         success = out["success"]
         steps   = out["steps"]
@@ -306,6 +436,40 @@ def main():
             print(f"  [{var_name}] SUCCESS  ({steps} steps)")
         else:
             print(f"  [{var_name}] FAILED   ({steps} steps, moving on)")
+            # ── VLM: failure diagnosis ─────────────────────────────────────
+            if vlm_analyzer is not None:
+                raw_obs = env.get_raw_obs()
+                pov_frame = None
+                if isinstance(raw_obs, dict):
+                    pov_frame = raw_obs.get("pov")
+                    if pov_frame is None:
+                        pov_frame = raw_obs.get("rgb")
+                if pov_frame is not None:
+                    vlm_fail = vlm_analyzer.analyze(
+                        np.asarray(pov_frame, dtype=np.uint8),
+                        var_name=var_name,
+                        context="failed",
+                    )
+                    if not vlm_fail.error:
+                        print(f"  [{var_name}] VLM diagnosis: {vlm_fail.reason[:100]}")
+
+        # ── CWM: online fine-tuning + PCG update ──────────────────────────────
+        if cwm_trainer is not None and out.get("trajectory"):
+            cwm_result = cwm_trainer.process_skill_trajectory(
+                trajectory=out["trajectory"],
+                skill_idx=var_idx,
+                evgs=evgs,
+                pcg=pcg,
+                verbose=False,
+            )
+            H_pcg = pcg.entropy()
+            beta  = _beta_sched(H_pcg)
+            intrinsic = cwm_result["mean_error"] * beta
+            print(f"  [{var_name}] CWM: err={cwm_result['mean_error']:.3f}  "
+                  f"loss={cwm_result['online_loss']:.4f}  "
+                  f"intrinsic_r={intrinsic:.3f}  "
+                  f"n_trans={cwm_result['n_transitions']}  "
+                  f"PCG_H={H_pcg:.3f}")
 
         # ── Collect frames from trajectory ────────────────────────────────────
         x_curr = evgs.extract(env.get_raw_obs() or {})
@@ -354,6 +518,22 @@ def main():
     diamond_id = _VAR_IDX["diamond"]
     if diamond_id in achieved:
         print("\n  *** DIAMOND MINED — GOAL ACHIEVED ***")
+
+    # ── CWM: print final PCG state after online adaptation ───────────────────
+    if cwm_trainer is not None:
+        print("\nFinal PCG after CWM online adaptation (edges >= 0.5):")
+        for i in range(M):
+            for j in range(M):
+                if i != j and pcg.probs[i, j] >= 0.5:
+                    print(f"  {VAR_NAMES[i]} → {VAR_NAMES[j]}: {pcg.probs[i,j]:.3f}")
+        print(f"PCG entropy: {pcg.entropy():.3f}")
+
+    # ── VLM stats ─────────────────────────────────────────────────────────────
+    if vlm_analyzer is not None:
+        s = vlm_analyzer.stats()
+        print(f"\nVLM stats: calls={s['total_calls']:.0f}  "
+              f"avg_latency={s['avg_latency_ms']:.0f}ms  "
+              f"error_rate={s['error_rate']:.2f}")
 
     # ── Write video ───────────────────────────────────────────────────────────
     try:

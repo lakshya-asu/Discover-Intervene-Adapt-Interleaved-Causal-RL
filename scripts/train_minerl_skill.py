@@ -36,6 +36,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import numpy as np
 
+from dia.clip_skill import CLIPGoalEncoder, SKILL_TEXTS
+
 _RECOMMENDED = {
     "wood":        500_000,
     "stone":       500_000,
@@ -55,13 +57,17 @@ VAR_NAMES = ["wood", "stone", "coal", "ironore", "furnace",
 _MINERL_ENV_ID = "MineRLObtainDiamondShovel-v0"
 
 
-def make_env(var_name: str, seed: int = 0, explore_bias: float = 0.0):
+def make_env(var_name: str, seed: int = 0, explore_bias: float = 0.0,
+             clip_encoder=None, clip_weight: float = 0.1):
     """Create a wrapped MineRL env for training skill_{var_name}.
 
     Args:
         explore_bias: probability (0–1) of sampling from skill-preferred actions
             during rollout collection. 0 = uniform random (SB3 default).
             ~0.7 is recommended: makes PPO see reward signals much sooner.
+        clip_encoder: CLIPGoalEncoder instance (optional). If provided, bakes a
+            512-dim CLIP text embedding into obs as 'clip_goal' and adds CLIP
+            cosine-similarity dense reward scaled by clip_weight.
     """
     import gym
     import minerl  # noqa: registers envs
@@ -70,19 +76,18 @@ def make_env(var_name: str, seed: int = 0, explore_bias: float = 0.0):
                                     BiasedDiscrete, SKILL_PREFERRED_ACTIONS,
                                     N_ACTIONS)
 
-    var_idx = VAR_NAMES.index(var_name)
-    evgs    = make_minerl_evgs()
+    var_idx    = VAR_NAMES.index(var_name)
+    evgs       = make_minerl_evgs()
+    goal_embed = clip_encoder.skill_embedding(var_name) if clip_encoder else None
 
     raw_env = gym.make(_MINERL_ENV_ID)
     raw_env.seed(seed)
 
-    env = MineRLObsWrapper(raw_env, evgs)
-    env = ItemRewardWrapper(env, target_var_idx=var_idx)
+    env = MineRLObsWrapper(raw_env, evgs, goal_embedding=goal_embed)
+    env = ItemRewardWrapper(env, target_var_idx=var_idx,
+                            clip_encoder=clip_encoder, clip_weight=clip_weight)
 
     # Bias action sampling toward skill-relevant actions during rollout collection.
-    # This does NOT restrict the model's output — PPO still learns over all N_ACTIONS.
-    # It only makes env.action_space.sample() (used by SB3 during exploration) hit
-    # useful actions more often, so reward signal appears earlier in training.
     if explore_bias > 0 and BiasedDiscrete is not None:
         preferred = SKILL_PREFERRED_ACTIONS.get(var_name, list(range(N_ACTIONS)))
         env.action_space = BiasedDiscrete(N_ACTIONS, preferred, bias_prob=explore_bias)
@@ -107,7 +112,22 @@ def main():
                     help="Probability of sampling skill-preferred actions during "
                          "PPO rollout collection (0=uniform random, 0.7=recommended). "
                          "Makes PPO see reward much sooner on hard-exploration tasks.")
+    ap.add_argument("--use_clip",    action="store_true",
+                    help="Add CLIP text embedding ('clip_goal') to obs and add "
+                         "cosine-similarity dense reward. Recommended.")
+    ap.add_argument("--clip_weight", type=float, default=0.1,
+                    help="Weight for CLIP reward term (default 0.1)")
+    ap.add_argument("--clip_device", type=str, default="cpu",
+                    help="Device for CLIP: 'cpu' or 'cuda'")
     args = ap.parse_args()
+
+    # ── CLIP setup ────────────────────────────────────────────────────────────
+    clip_encoder = None
+    if args.use_clip:
+        print(f"Loading CLIP (ViT-B/32) on {args.clip_device}...")
+        clip_encoder = CLIPGoalEncoder.get(device=args.clip_device)
+        goal_text = SKILL_TEXTS.get(args.var, f"gathering {args.var} in Minecraft")
+        print(f"  Goal text: \"{goal_text}\"")
 
     n_steps = args.steps if args.steps > 0 else _RECOMMENDED.get(args.var, 500_000)
     out_path = os.path.join(args.outdir, f"skill_{args.var}.zip")
@@ -118,10 +138,12 @@ def main():
     print(f"  steps:        {n_steps:,}")
     print(f"  output:       {out_path}")
     print(f"  device:       {args.device}")
-    print(f"  explore_bias: {args.explore_bias:.2f}  (fraction of rollout steps using skill-preferred actions)")
+    print(f"  explore_bias: {args.explore_bias:.2f}")
+    print(f"  CLIP:         {'enabled (weight=' + str(args.clip_weight) + ')' if args.use_clip else 'disabled'}")
 
     # ── Build env ─────────────────────────────────────────────────────────────
-    env = make_env(args.var, seed=args.seed, explore_bias=args.explore_bias)
+    env = make_env(args.var, seed=args.seed, explore_bias=args.explore_bias,
+                   clip_encoder=clip_encoder, clip_weight=args.clip_weight)
 
     # ── Train PPO ─────────────────────────────────────────────────────────────
     from stable_baselines3 import PPO

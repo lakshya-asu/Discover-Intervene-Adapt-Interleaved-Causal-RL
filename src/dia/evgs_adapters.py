@@ -72,17 +72,66 @@ def make_coinrun_evgs(var_names: Optional[List[str]] = None) -> EVGS:
 
 
 # ------------------------------ CausalWorld ------------------------------
+#
+# 5-variable EVGS for pick_and_place task.
+# Reads from info keys produced by CausalWorldInfoWrapper:
+#   block_z, dist_xy, success, fractional_success
+#
+# Ground-truth causal DAGs:
+#   T0 (small obstacle, h=0.02):
+#       grasped -> target_lifted -> target_above_goal -> task_success
+#   T1 (large obstacle, h=0.10, structural change):
+#       grasped -> target_lifted -> target_high_lifted -> target_above_goal -> task_success
+#   T2 (large tool_block, motor change):
+#       same DAG as T0; only pi_grasp motor policy needs retraining
+#
+# Intervention API:
+#   T1: env.do_intervention({"obstacle": {"size": np.array([0.5, 0.015, 0.10])}})
+#   T2: env.do_intervention({"tool_block": {"size": np.array([0.085, 0.085, 0.085])}})
+#
+# Obstacle bounds in pick_and_place:
+#   x=0.5 (fixed), y=0.015 (fixed), z: space_a=[0.02,0.065], space_b=[0.065,0.10]
 
-def make_causalworld_evgs(var_names: Optional[List[str]] = None) -> EVGS:
-    names = var_names or ["tower_height", "distance_to_goal", "grasped"]
+def make_causalworld_evgs(
+    var_names: Optional[List[str]] = None,
+    cfg=None,
+) -> EVGS:
+    """5-variable EVGS for CausalWorld pick_and_place.
+
+    Variables (indexed 0-4):
+        0  grasped            block_z > table_z + 0.01 (any lift from rest)
+        1  target_lifted      block_z > lifted_z_threshold  (~0.085m)
+        2  target_high_lifted block_z > high_lifted_z_threshold (~0.12m)
+        3  target_above_goal  xy dist to goal < above_goal_xy_threshold (~0.03m)
+        4  task_success       fractional_success > success_threshold (~0.9)
+    """
+    names = var_names or [
+        "grasped",
+        "target_lifted",
+        "target_high_lifted",
+        "target_above_goal",
+        "task_success",
+    ]
+
+    # Use defaults if no cfg provided
+    table_z = getattr(cfg, "table_z", 0.065)
+    lifted_thresh = getattr(cfg, "lifted_z_threshold", 0.085)
+    high_thresh = getattr(cfg, "high_lifted_z_threshold", 0.12)
+    xy_thresh = getattr(cfg, "above_goal_xy_threshold", 0.03)
+    succ_thresh = getattr(cfg, "success_threshold", 0.9)
 
     def obs_to_vars(obs):
         d = _ensure_dict_obs(obs)
         info = d.get("info", {}) or {}
-        height = float(info.get("stack_height", 0.0))
-        dist = float(info.get("distance_to_goal", 1.0))
-        grasped = float(bool(info.get("grasped", 0)))
-        return np.array([height, dist, grasped], dtype=float)
+        block_z = float(info.get("block_z", table_z))
+        dist_xy = float(info.get("dist_xy", 1.0))
+        frac = float(info.get("fractional_success", 0.0))
+        grasped = float(block_z > table_z + 0.01)
+        lifted = float(block_z > lifted_thresh)
+        high_lifted = float(block_z > high_thresh)
+        above_goal = float(dist_xy < xy_thresh)
+        success = float(frac > succ_thresh)
+        return np.array([grasped, lifted, high_lifted, above_goal, success], dtype=float)
 
     return EVGS(var_names=names, obs_to_vars=obs_to_vars)
 
