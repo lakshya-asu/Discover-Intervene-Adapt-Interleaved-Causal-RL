@@ -127,7 +127,7 @@ scripts/
   author  = {Jain, Lakshya Tushar},
   school  = {Arizona State University},
   year    = {2025},
-  type    = {Doctoral Dissertation},
+  type    = {MS Dissertation},
   note    = {ProQuest Dissertations \& Theses, No.\ 32283045}
 }
 ```
