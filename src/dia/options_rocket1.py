@@ -93,11 +93,22 @@ def _get_action_converters():
     return _ACTION_MAPPER, _ACTION_TRANSFORMER
 
 
-def _vpt_to_minedojo(action: dict) -> dict:
-    """Convert ROCKET-1 VPT action to MineDojo env-compatible named action dict.
+def _vpt_to_minedojo(action: dict) -> np.ndarray:
+    """Convert ROCKET-1 VPT action to MineDojo 8-dim MultiDiscrete array.
 
-    Input:  {'buttons': scalar tensor 0-8640, 'camera': scalar tensor 0-120}
-    Output: {'attack': 0|1, 'forward': 0|1, ..., 'camera': np.array([p, y])}
+    MineDojo NNActionSpaceWrapper dims (cam_interval=15°):
+      [fb, lr, jss, pitch_bin, yaw_bin, fn, craft_arg, slot]
+      fb:   0=noop, 1=forward, 2=back
+      lr:   0=noop, 1=left,    2=right
+      jss:  0=noop, 1=jump,    2=sneak,  3=sprint
+      pitch_bin / yaw_bin: 0-24, noop=12 (bin*15-180=degrees)
+      fn:   0=noop, 1=use, 2=drop, 3=attack, 4=craft, ...
+
+    Pipeline:
+      VPT {'buttons': 0-8640, 'camera': 0-120}
+      → CameraHierarchicalMapping.to_factored  →  buttons (20,), camera (2,)
+      → ActionTransformer.numpy_to_dict         →  named dict + continuous camera
+      → map to MineDojo 8-dim array
     """
     mapper, transformer = _get_action_converters()
     ac = {
@@ -106,8 +117,43 @@ def _vpt_to_minedojo(action: dict) -> dict:
         "camera":  action["camera"].cpu().numpy()  if hasattr(action["camera"],  "cpu")
                    else np.asarray(action["camera"]),
     }
-    factored = mapper.to_factored(ac)
-    return transformer.policy2env(factored)
+    factored = mapper.to_factored(ac)        # buttons (20,), camera (2,)
+    named    = transformer.numpy_to_dict(factored)  # named keys + continuous camera
+
+    arr = np.array([0, 0, 0, 12, 12, 0, 0, 0], dtype=np.int64)  # noop
+
+    # dim 0: forward/back
+    fwd = int(named.get("forward", 0))
+    bck = int(named.get("back", 0))
+    if fwd and not bck:
+        arr[0] = 1
+    elif bck and not fwd:
+        arr[0] = 2
+
+    # dim 1: left/right
+    lft = int(named.get("left", 0))
+    rgt = int(named.get("right", 0))
+    if lft and not rgt:
+        arr[1] = 1
+    elif rgt and not lft:
+        arr[1] = 2
+
+    # dim 2: jump/sneak/sprint
+    if   int(named.get("jump",   0)): arr[2] = 1
+    elif int(named.get("sprint", 0)): arr[2] = 3
+    elif int(named.get("sneak",  0)): arr[2] = 2
+
+    # dims 3-4: camera (VPT gives ±10° continuous; MineDojo bin = (deg+180)/15, noop=12)
+    cam = named.get("camera", np.zeros(2))
+    if hasattr(cam, "__len__") and len(cam) >= 2:
+        arr[3] = max(0, min(24, int(round((float(cam[0]) + 180) / 15))))
+        arr[4] = max(0, min(24, int(round((float(cam[1]) + 180) / 15))))
+
+    # dim 5: fn (attack takes priority over use)
+    if   int(named.get("attack", 0)): arr[5] = 3
+    elif int(named.get("use",    0)): arr[5] = 1
+
+    return arr
 
 
 # ---------------------------------------------------------------------------

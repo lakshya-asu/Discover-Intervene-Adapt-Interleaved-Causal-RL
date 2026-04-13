@@ -145,14 +145,14 @@ def main() -> int:
     try:
         from dia.options_rocket1 import _vpt_to_minedojo
         minedojo_action = _vpt_to_minedojo(action)
-        expected_keys = {"forward", "back", "left", "right", "jump", "attack", "use", "camera", "sprint"}
-        overlap = expected_keys & set(minedojo_action.keys())
+        # MineDojo expects 8-dim int64 MultiDiscrete array [fb,lr,jss,pitch,yaw,fn,craft,slot]
+        is_arr = isinstance(minedojo_action, np.ndarray) and minedojo_action.shape == (8,)
         results.append(check(
-            "converted action has MineDojo keys",
-            len(overlap) >= 5,
-            f"{len(overlap)}/{len(expected_keys)} expected: {sorted(overlap)}",
+            "converted action is 8-dim int64 array",
+            is_arr,
+            f"shape={getattr(minedojo_action, 'shape', '?')} dtype={getattr(minedojo_action, 'dtype', '?')}",
         ))
-        print(f"       camera delta: {minedojo_action.get('camera')}")
+        print(f"       action array: {minedojo_action}  (fb,lr,jss,pitch,yaw,fn,craft,slot)")
     except Exception as e:
         import traceback; traceback.print_exc()
         results.append(check("VPT→MineDojo conversion", False, str(e)))
