@@ -1285,17 +1285,39 @@ class VoxelGatherWrapper(MineDojoObsWrapper):
         self._voxel_extract_target = _vet
         self._get_agent_state      = _gas
 
-        # Override gym spaces for SB3
+        # Build custom spaces (prefer gymnasium; fall back to gym)
+        # MineDojoObsWrapper defines observation_space/action_space as read-only
+        # properties, so we store the values in private attrs and override below.
         try:
-            import gym
-            from gym import spaces as _spaces
-            self.observation_space = _spaces.Dict({
+            try:
+                import gymnasium as _gym_mod
+            except ImportError:
+                import gym as _gym_mod
+            _spaces = _gym_mod.spaces
+            self._voxel_obs_space = _spaces.Dict({
                 "target_voxel": _spaces.Box(0.0, 1.0, (self._voxel_dim,), dtype=np.float32),
                 "agent_state":  _spaces.Box(-1.0, 1.0, (6,), dtype=np.float32),
             })
-            self.action_space = _spaces.Discrete(N_GATHER_ACTIONS)
-        except Exception:
-            pass
+            self._voxel_act_space = _spaces.Discrete(N_GATHER_ACTIONS)
+        except Exception as _e:
+            import warnings
+            warnings.warn(f"VoxelGatherWrapper: could not build gym spaces: {_e}")
+            self._voxel_obs_space = None
+            self._voxel_act_space = None
+
+    # -- Override spaces as properties (parent defines them read-only) --
+
+    @property
+    def observation_space(self):
+        if self._voxel_obs_space is not None:
+            return self._voxel_obs_space
+        return self.env.observation_space
+
+    @property
+    def action_space(self):
+        if self._voxel_act_space is not None:
+            return self._voxel_act_space
+        return self.env.action_space
 
     # -- Override step to translate Discrete(10) to 8-dim array --
 
@@ -1374,13 +1396,17 @@ class VoxelRewardWrapper:
     def __init__(self, env: VoxelGatherWrapper, skill_name: str, evgs: "EVGS",
                  proximity_scale: float = 0.1,
                  acq_reward: float = 1.0,
-                 time_penalty: float = -0.005):
+                 time_penalty: float = -0.005,
+                 look_at_scale: float = 0.05,
+                 forward_look_bonus: float = 0.002):
         self.env             = env
         self.skill_name      = skill_name
         self.evgs            = evgs
         self.proximity_scale = proximity_scale
         self.acq_reward      = acq_reward
         self.time_penalty    = time_penalty
+        self.look_at_scale   = look_at_scale      # reward for facing target block
+        self.forward_look_bonus = forward_look_bonus  # reward for pitch near 0
 
         self._prev_dist      = self._max_dist()
         self._prev_count     = 0
@@ -1408,9 +1434,21 @@ class VoxelRewardWrapper:
         shaped = self.time_penalty
 
         # Proximity signal (only when target visible)
-        if self._prev_dist < self._max_dist() or curr_dist < self._max_dist():
+        target_visible = curr_dist < self._max_dist()
+        if self._prev_dist < self._max_dist() or target_visible:
             delta = self._prev_dist - curr_dist
             shaped += float(np.clip(self.proximity_scale * delta, -0.2, 0.5))
+
+        # Look-at reward: bonus for having the look vector aimed at a target block
+        if target_visible and self.look_at_scale > 0:
+            look_bonus = self._look_at_target_reward(obs)
+            shaped += self.look_at_scale * look_bonus
+
+        # Forward-looking bonus when no target visible: reward pitch near 0 (eye level)
+        if not target_visible and self.forward_look_bonus > 0:
+            pitch_norm = obs.get("agent_state", np.zeros(6))[0]  # pitch/90
+            # pitch_norm ~0 means looking forward; abs value near 1 = extreme tilt
+            shaped += self.forward_look_bonus * max(0.0, 1.0 - abs(float(pitch_norm)) * 3.0)
 
         # Acquisition reward
         if curr_count > self._prev_count:
@@ -1456,6 +1494,48 @@ class VoxelRewardWrapper:
             return float(dists.min())
         except Exception:
             return self._max_dist()
+
+    def _look_at_target_reward(self, obs: Dict[str, np.ndarray]) -> float:
+        """
+        Return 0-1 score: max cos_look_vec_angle over target-block cells.
+
+        Uses raw obs from the inner VoxelGatherWrapper env. If unavailable,
+        falls back to 0 (no bonus).
+        """
+        raw = self.env.get_raw_obs()
+        if raw is None or not isinstance(raw, dict):
+            return 0.0
+        voxels = raw.get("voxels", None)
+        if voxels is None:
+            return 0.0
+
+        # Get the target_voxel mask and cos_look_vec_angle array
+        tv = obs.get("target_voxel", None)
+        if tv is None or tv.sum() == 0:
+            return 0.0
+
+        try:
+            vs = self.env._voxel_size
+            # cos_look_vec_angle: (X, Y, Z) or structured array
+            if isinstance(voxels, dict):
+                cos_arr = np.asarray(voxels.get("cos_look_vec_angle",
+                                                np.zeros(vs, dtype=np.float32)))
+            elif hasattr(voxels, "dtype") and "cos_look_vec_angle" in (voxels.dtype.names or []):
+                cos_arr = np.asarray(voxels["cos_look_vec_angle"])
+            else:
+                return 0.0
+
+            if cos_arr.shape != tuple(vs):
+                return 0.0
+
+            mask = tv.reshape(vs) > 0.5
+            if not mask.any():
+                return 0.0
+
+            # Max cos angle on target cells, clamped to [0, 1]
+            return float(np.clip(cos_arr[mask].max(), 0.0, 1.0))
+        except Exception:
+            return 0.0
 
     def _inv_count(self) -> int:
         raw = self.env.get_raw_obs()

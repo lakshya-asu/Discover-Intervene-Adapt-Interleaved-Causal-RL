@@ -63,9 +63,9 @@ def parse_args():
                    help="world seed for MineDojo (default 0)")
     p.add_argument("--out",    type=str, default=None,
                    help="output path for saved .zip (default: models/minedojo/gather_<skill>.zip)")
-    p.add_argument("--voxel_size", type=int, nargs=3, default=[7, 3, 7],
+    p.add_argument("--voxel_size", type=int, nargs=3, default=[13, 7, 13],
                    metavar=("X", "Y", "Z"),
-                   help="voxel grid size (default 7 3 7)")
+                   help="voxel grid size (default 13 7 13)")
     p.add_argument("--n_steps",   type=int, default=2048,
                    help="PPO n_steps rollout buffer size (default 2048)")
     p.add_argument("--batch_size", type=int, default=64,
@@ -99,7 +99,6 @@ def make_env(skill: str, seed: int, voxel_size: list):
         specified_biome="forest",
         use_voxel=True,
         voxel_size=voxel_dict,
-        initial_mobs=[],
     )
 
     evgs = make_minedojo_evgs()
@@ -115,30 +114,43 @@ def make_env(skill: str, seed: int, voxel_size: list):
     return env
 
 
-class _GymAdapter:
+try:
+    import gymnasium as _gymnasium
+    _GymEnvBase = _gymnasium.Env
+except ImportError:
+    import gym as _gymnasium
+    _GymEnvBase = _gymnasium.Env
+
+
+class _GymAdapter(_GymEnvBase):
     """
     Thin adapter to make VoxelRewardWrapper compatible with SB3's env expectations.
 
-    VoxelRewardWrapper is not a gym.Env subclass; SB3 needs render() and the
-    standard gymnasium contract. This adapter provides that without adding
-    gym.Wrapper overhead.
+    Inherits from gymnasium.Env so that SB3's isinstance check passes.
     """
 
+    metadata = {"render_modes": []}
+
     def __init__(self, wrapped):
+        super().__init__()
         self._w = wrapped
         self.observation_space = wrapped.observation_space
         self.action_space      = wrapped.action_space
 
     def reset(self, **kwargs):
+        # MineDojo doesn't accept 'seed' or 'options' kwargs from gymnasium API
+        kwargs.pop("seed", None)
+        kwargs.pop("options", None)
         obs = self._w.reset(**kwargs)
-        return obs[0] if isinstance(obs, tuple) else obs
+        return (obs[0] if isinstance(obs, tuple) else obs), {}
 
     def step(self, action):
         result = self._w.step(action)
         obs, rew, done, info = result
-        return obs, rew, done, info
+        # gymnasium step → (obs, reward, terminated, truncated, info)
+        return obs, float(rew), bool(done), False, info
 
-    def render(self, mode="human"):
+    def render(self):
         pass
 
     def close(self):
@@ -177,7 +189,8 @@ def train(args):
 
     if args.dry_run:
         print("\n[dry_run] resetting env...")
-        obs = env.reset()
+        result = env.reset()
+        obs = result[0] if isinstance(result, tuple) else result
         for k, v in obs.items():
             print(f"  {k}: shape={v.shape}  dtype={v.dtype}  "
                   f"min={v.min():.3f}  max={v.max():.3f}  sum={v.sum():.1f}")
@@ -187,11 +200,13 @@ def train(args):
 
     # PPO model
     voxel_dim = int(np.prod(args.voxel_size))
+    # Wider first layer for larger voxel obs (13x7x13 = 1183 dims)
+    hidden = 512 if voxel_dim > 500 else 256
     policy_kwargs = dict(
-        net_arch=[256, 256],
+        net_arch=[hidden, hidden],
     )
 
-    print(f"\n[ppo] building model  skill={args.skill}  voxel_dim={voxel_dim}")
+    print(f"\n[ppo] building model  skill={args.skill}  voxel_dim={voxel_dim}  hidden={hidden}")
     model = PPO(
         "MultiInputPolicy",
         env,
