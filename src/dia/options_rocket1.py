@@ -226,13 +226,7 @@ class ROCKET1GatherOption:
         trajectory: list = []
 
         for _ in range(self.cfg.max_steps):
-            rgb = obs.get("rgb", np.zeros((224, 224, 3), dtype=np.uint8))
-
-            # Ensure 224×224 — env should already be at this size when
-            # run_transfer_minedojo passes image_size=(224,224), but guard anyway
-            if rgb.shape[:2] != (224, 224):
-                import cv2
-                rgb = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_LINEAR)
+            rgb = self._get_rgb_224(obs)
 
             # Build segmentation mask: voxel-derived if available, else full-frame
             obj_mask = self._make_mask(obs, rgb.shape[:2])
@@ -326,3 +320,29 @@ class ROCKET1GatherOption:
 
         # Full-frame fallback
         return np.ones((H, W), dtype=np.uint8)
+
+    def _get_rgb_224(self, obs: dict) -> np.ndarray:
+        """
+        Extract a (224, 224, 3) uint8 C-contiguous numpy array from obs.
+
+        The MinedojoObsWrapper downsizes to 64×64 internally, so we upscale.
+        We apply np.ascontiguousarray to satisfy cv2's memory-layout requirement
+        (transposed views from channel-first→channel-last conversion are
+        non-contiguous and cause cv2.error "src is not a numpy array").
+        """
+        try:
+            rgb = obs.get("rgb")
+            if rgb is None:
+                raise ValueError("no rgb key")
+            # Force a proper C-contiguous uint8 numpy array
+            rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8))
+            # Handle channel-first (3, H, W) → (H, W, 3)
+            if rgb.ndim == 3 and rgb.shape[0] == 3 and rgb.shape[2] != 3:
+                rgb = np.ascontiguousarray(rgb.transpose(1, 2, 0))
+            if rgb.shape[:2] != (224, 224):
+                import cv2
+                rgb = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_LINEAR)
+            return rgb
+        except Exception as exc:
+            logger.debug("_get_rgb_224 fallback (%s)", exc)
+            return np.zeros((224, 224, 3), dtype=np.uint8)
