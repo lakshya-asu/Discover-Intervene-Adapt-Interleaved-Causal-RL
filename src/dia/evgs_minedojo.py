@@ -182,3 +182,135 @@ def inventory_summary(obs: Any) -> str:
 
 # Alias with explicit backend suffix for cross-backend imports
 inventory_summary_minedojo = inventory_summary
+
+# ---------------------------------------------------------------------------
+# Voxel observation utilities
+# ---------------------------------------------------------------------------
+
+# Block names in MineDojo voxel obs that yield the target item when mined.
+# Used by VoxelGatherWrapper to build the binary target_voxel observation.
+SKILL_TARGETS: Dict[str, List[str]] = {
+    "wood": [
+        "log", "oak_log", "birch_log", "spruce_log", "jungle_log",
+        "acacia_log", "dark_oak_log", "mangrove_log",
+        # without namespace prefix (MineDojo sometimes strips "minecraft:")
+        "minecraft:log", "minecraft:oak_log",
+    ],
+    "stone": [
+        "stone", "cobblestone", "minecraft:stone", "minecraft:cobblestone",
+    ],
+    "coal": [
+        "coal_ore", "deepslate_coal_ore",
+        "minecraft:coal_ore", "minecraft:deepslate_coal_ore",
+    ],
+    "ironore": [
+        "iron_ore", "deepslate_iron_ore",
+        "minecraft:iron_ore", "minecraft:deepslate_iron_ore",
+    ],
+    "diamond": [
+        "diamond_ore", "deepslate_diamond_ore",
+        "minecraft:diamond_ore", "minecraft:deepslate_diamond_ore",
+    ],
+}
+
+
+def voxel_extract_target(raw_obs: Any, skill_name: str) -> np.ndarray:
+    """
+    Build a binary target-block mask from MineDojo's voxel observation.
+
+    Returns a flattened float32 array with 1.0 where the voxel cell contains
+    a block that is a target for `skill_name`, 0.0 elsewhere.
+
+    If voxel data is absent or the skill has no targets defined, returns a
+    zero array of shape (1,) so callers can always concatenate safely.
+
+    Parameters
+    ----------
+    raw_obs    : raw MineDojo observation dict (before wrapping)
+    skill_name : one of the keys in SKILL_TARGETS
+
+    Returns
+    -------
+    np.ndarray  shape (N,) float32, where N = product of the voxel grid dims
+    """
+    targets = set(t.lower() for t in SKILL_TARGETS.get(skill_name, []))
+    if not targets:
+        return np.zeros(1, dtype=np.float32)
+
+    try:
+        voxel_obs = raw_obs.get("voxels", None) if isinstance(raw_obs, dict) else None
+        if voxel_obs is None:
+            return np.zeros(1, dtype=np.float32)
+
+        # MineDojo voxel obs is a dict or structured array with 'block_name'
+        if isinstance(voxel_obs, dict):
+            block_names = voxel_obs.get("block_name", None)
+        elif hasattr(voxel_obs, "dtype") and hasattr(voxel_obs.dtype, "names"):
+            block_names = voxel_obs["block_name"] if "block_name" in voxel_obs.dtype.names else None
+        else:
+            block_names = None
+
+        if block_names is None:
+            return np.zeros(1, dtype=np.float32)
+
+        flat = np.asarray(block_names).ravel()
+        mask = np.array(
+            [1.0 if str(b).lower().strip().rstrip("\x00") in targets else 0.0
+             for b in flat],
+            dtype=np.float32,
+        )
+        return mask
+
+    except Exception:
+        return np.zeros(1, dtype=np.float32)
+
+
+def get_agent_state(raw_obs: Any) -> np.ndarray:
+    """
+    Extract a 6-dim normalized agent state vector from a MineDojo raw obs.
+
+    Returns
+    -------
+    np.ndarray  shape (6,) float32
+        [pitch/90, yaw/180, health/20, food/20, on_ground, 0.0]
+
+    All values are clipped to [-1, 1] after normalization.
+    Missing keys fall back to 0.0.
+    """
+    state = np.zeros(6, dtype=np.float32)
+    try:
+        if not isinstance(raw_obs, dict):
+            return state
+
+        loc  = raw_obs.get("location_stats", {}) or {}
+        life = raw_obs.get("life_stats", {}) or {}
+
+        def _get(d, key, default=0.0):
+            val = d.get(key, default)
+            if val is None:
+                return default
+            try:
+                return float(np.asarray(val).ravel()[0])
+            except Exception:
+                return default
+
+        pitch    = _get(loc,  "pitch",      0.0)
+        yaw      = _get(loc,  "yaw",        0.0)
+        health   = _get(life, "life",        20.0)
+        food     = _get(life, "food",        20.0)
+        # on_ground may be in location_stats or life_stats depending on MineDojo version
+        on_ground = float(_get(loc, "is_grounded",
+                          _get(loc, "on_ground",
+                          _get(life, "is_grounded", 1.0))))
+
+        state[0] = float(np.clip(pitch / 90.0,  -1.0, 1.0))
+        state[1] = float(np.clip(yaw   / 180.0, -1.0, 1.0))
+        state[2] = float(np.clip(health / 20.0,  0.0, 1.0))
+        state[3] = float(np.clip(food   / 20.0,  0.0, 1.0))
+        state[4] = float(np.clip(on_ground,       0.0, 1.0))
+        state[5] = 0.0  # reserved for has_tool (set by VoxelGatherWrapper)
+
+    except Exception:
+        pass
+
+    return state

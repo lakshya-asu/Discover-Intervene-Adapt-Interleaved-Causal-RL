@@ -1222,3 +1222,340 @@ def load_bc_option(skill: str, pt_path: str,
         print(f"  [{skill}] WARNING: could not load BC policy from {pt_path}: {exc}")
         return None
 
+
+# ---------------------------------------------------------------------------
+# Gather skill action set (10-action subset for voxel-conditioned PPO)
+# ---------------------------------------------------------------------------
+
+# Maps discrete index 0-9 to MineDojo 8-dim MultiDiscrete array.
+# [fb, lr, jss, pitch_bin, yaw_bin, fn, craft_arg, slot]
+# Noop bins: pitch=12, yaw=12 (bin*15-180=0 degrees)
+# fn: 0=noop, 1=use, 2=drop, 3=attack, 4=craft, 5=equip, 6=place, 7=destroy
+GATHER_ACTIONS = np.array([
+    [0, 0, 0, 12, 12, 0, 0, 0],  # 0: noop
+    [1, 0, 0, 12, 12, 0, 0, 0],  # 1: forward
+    [0, 0, 0, 12, 12, 3, 0, 0],  # 2: attack
+    [1, 0, 0, 12, 12, 3, 0, 0],  # 3: forward + attack
+    [0, 0, 0, 12, 13, 0, 0, 0],  # 4: yaw right +15 degrees
+    [0, 0, 0, 12, 11, 0, 0, 0],  # 5: yaw left  -15 degrees
+    [0, 0, 0, 13, 12, 0, 0, 0],  # 6: look down +15 degrees pitch
+    [0, 0, 0, 11, 12, 0, 0, 0],  # 7: look up   -15 degrees pitch
+    [1, 0, 1, 12, 12, 0, 0, 0],  # 8: forward + jump
+    [1, 0, 3, 12, 12, 3, 0, 0],  # 9: sprint + forward + attack
+], dtype=np.int64)
+
+N_GATHER_ACTIONS = len(GATHER_ACTIONS)
+
+
+# ---------------------------------------------------------------------------
+# VoxelGatherWrapper: adds target_voxel + agent_state to observation
+# ---------------------------------------------------------------------------
+
+class VoxelGatherWrapper(MineDojoObsWrapper):
+    """
+    Extends MineDojoObsWrapper with voxel-based target block observations
+    for training gather skill policies with PPO.
+
+    Observation dict keys:
+      "target_voxel"  (N,) float32 binary: 1 where voxel contains a target block
+      "agent_state"   (6,) float32 normalized: [pitch, yaw, health, food, on_ground, has_tool]
+
+    Action space: Discrete(10) mapped through GATHER_ACTIONS to 8-dim MineDojo arrays.
+
+    Parameters
+    ----------
+    env         : raw MineDojo environment (with use_voxel=True)
+    evgs        : EVGS instance from make_minedojo_evgs()
+    skill_name  : one of SKILL_TARGETS keys ('wood', 'stone', 'coal', 'ironore', 'diamond')
+    tool_var_idx: index in the EVGS inventory vector for the required tool (-1 if hand only)
+    voxel_size  : voxel grid dimensions passed to minedojo.make(); default (7, 3, 7)
+    """
+
+    def __init__(self, env, evgs: "EVGS", skill_name: str,
+                 tool_var_idx: int = -1,
+                 voxel_size: tuple = (7, 3, 7)):
+        super().__init__(env, evgs)
+        self.skill_name    = skill_name
+        self.tool_var_idx  = tool_var_idx
+        self._voxel_size   = voxel_size
+        self._voxel_dim    = int(voxel_size[0]) * int(voxel_size[1]) * int(voxel_size[2])
+
+        # Import lazily to avoid circular imports at module load time
+        from .evgs_minedojo import voxel_extract_target as _vet, get_agent_state as _gas
+        self._voxel_extract_target = _vet
+        self._get_agent_state      = _gas
+
+        # Override gym spaces for SB3
+        try:
+            import gym
+            from gym import spaces as _spaces
+            self.observation_space = _spaces.Dict({
+                "target_voxel": _spaces.Box(0.0, 1.0, (self._voxel_dim,), dtype=np.float32),
+                "agent_state":  _spaces.Box(-1.0, 1.0, (6,), dtype=np.float32),
+            })
+            self.action_space = _spaces.Discrete(N_GATHER_ACTIONS)
+        except Exception:
+            pass
+
+    # -- Override step to translate Discrete(10) to 8-dim array --
+
+    def step(self, action_idx: int):
+        """Accept Discrete(10) index, translate to 8-dim, step raw env."""
+        idx = int(action_idx) % N_GATHER_ACTIONS
+        act8 = GATHER_ACTIONS[idx]
+        result = self.env.step(act8)
+        if len(result) == 5:
+            raw, rew, term, trunc, info = result
+            done = term or trunc
+        else:
+            raw, rew, done, info = result
+        self._last_raw = raw
+        return self._convert(raw), float(rew), bool(done), info
+
+    # -- Override _convert to inject voxel + agent_state --
+
+    def _convert(self, raw_obs: Any) -> Dict[str, np.ndarray]:
+        target_voxel = self._voxel_extract_target(raw_obs, self.skill_name)
+        # Pad or truncate to expected size in case voxel shape differs
+        if target_voxel.shape[0] != self._voxel_dim:
+            padded = np.zeros(self._voxel_dim, dtype=np.float32)
+            n = min(target_voxel.shape[0], self._voxel_dim)
+            padded[:n] = target_voxel[:n]
+            target_voxel = padded
+
+        agent_state = self._get_agent_state(raw_obs).copy()
+        # Fill has_tool slot (index 5) from inventory vector
+        if self.tool_var_idx >= 0:
+            inv = self.evgs.extract(raw_obs)
+            agent_state[5] = float(inv[self.tool_var_idx] > 0.5)
+
+        return {
+            "target_voxel": target_voxel,
+            "agent_state":  agent_state,
+        }
+
+    def get_obs(self) -> Dict[str, np.ndarray]:
+        if self._last_raw is not None:
+            return self._convert(self._last_raw)
+        return {
+            "target_voxel": np.zeros(self._voxel_dim, dtype=np.float32),
+            "agent_state":  np.zeros(6, dtype=np.float32),
+        }
+
+
+# ---------------------------------------------------------------------------
+# VoxelRewardWrapper: proximity + acquisition reward shaping
+# ---------------------------------------------------------------------------
+
+class VoxelRewardWrapper:
+    """
+    Reward shaping wrapper for gather skill training.
+
+    Wraps a VoxelGatherWrapper and adds three reward signals:
+
+    1. Proximity delta: +scale * (prev_dist - curr_dist) per step when target
+       block is visible in the voxel grid.  Encourages navigation toward target.
+    2. Acquisition: +1.0 when target item count in inventory increases.
+    3. Time penalty: -0.005 per step (encourages efficiency).
+
+    Distance is the L1 distance (in voxel grid coordinates) to the nearest
+    target-block cell. When no target is visible the proximity signal is 0.
+
+    Parameters
+    ----------
+    env             : VoxelGatherWrapper instance
+    skill_name      : gather skill name (matches SKILL_TARGETS keys)
+    evgs            : EVGS instance
+    proximity_scale : reward scaling for proximity delta (default 0.1)
+    acq_reward      : reward for acquiring one unit of target item (default 1.0)
+    time_penalty    : per-step penalty (default -0.005)
+    """
+
+    def __init__(self, env: VoxelGatherWrapper, skill_name: str, evgs: "EVGS",
+                 proximity_scale: float = 0.1,
+                 acq_reward: float = 1.0,
+                 time_penalty: float = -0.005):
+        self.env             = env
+        self.skill_name      = skill_name
+        self.evgs            = evgs
+        self.proximity_scale = proximity_scale
+        self.acq_reward      = acq_reward
+        self.time_penalty    = time_penalty
+
+        self._prev_dist      = self._max_dist()
+        self._prev_count     = 0
+
+        # Forward gym spaces
+        self.observation_space = env.observation_space
+        self.action_space      = env.action_space
+
+        # Target item names (from ScriptedGatherOption._SKILL_ITEMS)
+        self._target_items = ScriptedGatherOption._SKILL_ITEMS.get(skill_name, [skill_name])
+
+    def reset(self, **kwargs):
+        obs = self.env.reset(**kwargs)
+        obs = obs[0] if isinstance(obs, tuple) else obs
+        self._prev_dist  = self._dist_from_obs(obs)
+        self._prev_count = self._inv_count()
+        return obs
+
+    def step(self, action):
+        obs, ext_rew, done, info = self.env.step(action)
+
+        curr_dist  = self._dist_from_obs(obs)
+        curr_count = self._inv_count()
+
+        shaped = self.time_penalty
+
+        # Proximity signal (only when target visible)
+        if self._prev_dist < self._max_dist() or curr_dist < self._max_dist():
+            delta = self._prev_dist - curr_dist
+            shaped += float(np.clip(self.proximity_scale * delta, -0.2, 0.5))
+
+        # Acquisition reward
+        if curr_count > self._prev_count:
+            shaped += self.acq_reward * (curr_count - self._prev_count)
+
+        self._prev_dist  = curr_dist
+        self._prev_count = curr_count
+
+        return obs, float(ext_rew + shaped), bool(done), info
+
+    # Passthrough
+    def get_obs(self):
+        return self.env.get_obs()
+
+    def get_raw_obs(self):
+        return self.env.get_raw_obs()
+
+    def step_command(self, action_type, item_name):
+        return self.env.step_command(action_type, item_name)
+
+    # -- Helpers --
+
+    def _max_dist(self) -> float:
+        """Max possible L1 distance in voxel grid (used as sentinel for no target)."""
+        vs = self.env._voxel_size
+        return float(vs[0] + vs[1] + vs[2])
+
+    def _dist_from_obs(self, obs: Dict[str, np.ndarray]) -> float:
+        """L1 distance to nearest target cell in flattened target_voxel."""
+        tv = obs.get("target_voxel", None)
+        if tv is None or tv.sum() == 0:
+            return self._max_dist()
+        vs = self.env._voxel_size
+        # Reshape to 3D (x, y, z) and find nearest 1-cell
+        try:
+            grid = tv.reshape(vs)
+            coords = np.argwhere(grid > 0.5)
+            if len(coords) == 0:
+                return self._max_dist()
+            # Agent is at center of grid
+            center = np.array([vs[0] // 2, vs[1] // 2, vs[2] // 2])
+            dists  = np.abs(coords - center).sum(axis=1)
+            return float(dists.min())
+        except Exception:
+            return self._max_dist()
+
+    def _inv_count(self) -> int:
+        raw = self.env.get_raw_obs()
+        if raw is None:
+            return 0
+        counts = _parse_inv_counts(raw)
+        return sum(counts.get(item, 0) for item in self._target_items)
+
+
+# ---------------------------------------------------------------------------
+# VoxelGatherOption: SB3 PPO policy option for gather skills
+# ---------------------------------------------------------------------------
+
+class VoxelGatherOption(OptionPolicy):
+    """
+    Executes a pre-trained SB3 PPO gather policy that operates on voxel
+    observations (target_voxel + agent_state) to navigate toward and mine
+    a target block.
+
+    Usage
+    -----
+    env must be a VoxelGatherWrapper (provides target_voxel + agent_state obs,
+    Discrete(10) action space).
+
+    model_path : path to a .zip file saved by scripts/train_gather_skill.py
+                 (SB3 PPO with MultiInputPolicy).
+
+    Parameters
+    ----------
+    subgoal    : Subgoal(var_index, predicate=UP) for the target EVGS variable
+    cfg        : OptionConfig (max_steps, terminate_on_success)
+    model_path : path to SB3 PPO .zip, or a pre-loaded SB3 model instance
+    skill_name : gather skill name for logging
+    """
+
+    def __init__(self, subgoal: "Subgoal", cfg: "OptionConfig",
+                 model_path, skill_name: str = ""):
+        super().__init__(subgoal, cfg)
+        self.skill_name = skill_name
+        self._model     = None
+
+        if SB3_OK and model_path is not None:
+            if isinstance(model_path, str):
+                self._model = SB3PPO.load(model_path)
+            else:
+                self._model = model_path   # pre-loaded
+
+    def act(self, obs: Dict[str, np.ndarray]) -> int:
+        """Predict action using PPO policy; fallback to attack (idx 2) if no model."""
+        if self._model is None:
+            return 2  # attack
+        action, _ = self._model.predict(obs, deterministic=True)
+        return int(action)
+
+    def run(self, env, evgs: "EVGS") -> Dict[str, Any]:
+        """
+        Execute PPO gather policy until subgoal achieved or max_steps exceeded.
+
+        env must be a VoxelGatherWrapper or compatible (exposes get_obs() returning
+        {'target_voxel': ..., 'agent_state': ...}).
+        """
+        if not hasattr(env, "get_obs"):
+            raise TypeError("VoxelGatherOption.run requires env with get_obs()")
+
+        obs     = env.get_obs()
+        steps   = 0
+        success = False
+        done    = False
+        trajectory: list = []
+
+        while steps < self.cfg.max_steps:
+            action = self.act(obs)
+
+            result = env.step(action)
+            if len(result) == 5:
+                next_obs, _rew, term, trunc, _info = result
+                done = term or trunc
+            else:
+                next_obs, _rew, done, _info = result
+
+            x_curr = evgs.extract(obs)
+            x_next = evgs.extract(next_obs)
+            succ   = EVGS.predicate_holds(x_curr, x_next, self.subgoal)
+
+            trajectory.append((obs, action, next_obs, succ))
+            obs   = next_obs
+            steps += 1
+
+            if succ:
+                success = True
+                if self.cfg.terminate_on_success:
+                    break
+            if done:
+                break
+
+        return {
+            "success":      success,
+            "steps":        steps,
+            "trajectory":   trajectory,
+            "final_obs":    obs,
+            "episode_done": done,
+        }
+
