@@ -92,17 +92,22 @@ def main() -> int:
     dummy_rgb = np.random.randint(0, 256, (224, 224, 3), dtype=np.uint8)
     dummy_mask = np.ones((224, 224), dtype=np.uint8)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    memory = policy.initial_state()
+    # Pass state_in=None on first call — model creates initial state internally.
+    # initial_state() returns squeezed tensors that cause dim mismatch when
+    # passed back through get_action("*")'s single unsqueeze.
     rocket_input = {
         "image": dummy_rgb,
         "segment": {
-            "obj_id":   torch.tensor([2], dtype=torch.int64).to(device),
+            # Scalar obj_id: _batchify does 2x unsqueeze → (1,1), so interaction()
+            # outputs (1,1,hiddim) 3D.  Using [2] → (1,) → (1,1,1) → (1,1,1,hiddim)
+            # 4D would corrupt the KV-cache shape in xf.py update_state.
+            "obj_id":   torch.tensor(2, dtype=torch.int64).to(device),
             "obj_mask": torch.tensor(dummy_mask, dtype=torch.uint8).to(device),
         },
     }
     try:
         action, memory = policy.get_action(
-            input=rocket_input, state_in=memory, input_shape="*", deterministic=False
+            input=rocket_input, state_in=None, input_shape="*", deterministic=False
         )
         results.append(check("get_action() returns without error", True))
     except Exception as e:
@@ -113,25 +118,44 @@ def main() -> int:
         return 1
 
     # ------------------------------------------------------------------
-    # 5. Action format
+    # 5. Action output format
     # ------------------------------------------------------------------
-    print("\n[5] Action output format")
+    print("\n[5] Action output format (VPT CameraHierarchical)")
     is_dict = isinstance(action, dict)
     results.append(check("action is dict", is_dict, str(type(action))))
     if is_dict:
         print(f"       keys: {sorted(action.keys())}")
-        # Expect MineDojo action keys
-        expected_keys = {"forward", "back", "left", "right", "jump", "attack",
-                         "use", "camera", "sprint"}
-        overlap = expected_keys & set(action.keys())
+        # ROCKET-1 uses VPT CameraHierarchical: 'buttons' (0-8640) + 'camera' (0-120)
+        has_vpt_keys = "buttons" in action and "camera" in action
         results.append(check(
-            "action has MineDojo keys",
-            len(overlap) >= 3,
-            f"{len(overlap)}/{len(expected_keys)} expected keys found: {sorted(overlap)}",
+            "action has VPT keys (buttons + camera)",
+            has_vpt_keys,
+            f"keys={sorted(action.keys())}",
         ))
     else:
         print(f"       action value: {action!r}")
         results.append(False)
+
+    # ------------------------------------------------------------------
+    # 5b. VPT → MineDojo action conversion
+    # ------------------------------------------------------------------
+    print("\n[5b] VPT → MineDojo action conversion")
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+    try:
+        from dia.options_rocket1 import _vpt_to_minedojo
+        minedojo_action = _vpt_to_minedojo(action)
+        expected_keys = {"forward", "back", "left", "right", "jump", "attack", "use", "camera", "sprint"}
+        overlap = expected_keys & set(minedojo_action.keys())
+        results.append(check(
+            "converted action has MineDojo keys",
+            len(overlap) >= 5,
+            f"{len(overlap)}/{len(expected_keys)} expected: {sorted(overlap)}",
+        ))
+        print(f"       camera delta: {minedojo_action.get('camera')}")
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        results.append(check("VPT→MineDojo conversion", False, str(e)))
 
     # ------------------------------------------------------------------
     # 6. Recurrent state preserved
@@ -139,8 +163,8 @@ def main() -> int:
     print("\n[6] Recurrent hidden state")
     results.append(check(
         "hidden state returned",
-        hidden is not None,
-        f"type={type(hidden).__name__}",
+        memory is not None,
+        f"type={type(memory).__name__}, len={len(memory) if isinstance(memory, list) else 'n/a'}",
     ))
 
     _print_summary(results)

@@ -70,6 +70,45 @@ _SKILL_OBJ_ID: dict[str, int] = {
 _ROCKET1_POLICY: Optional[Any] = None
 _ROCKET1_LOAD_ATTEMPTED: bool = False
 
+# ---------------------------------------------------------------------------
+# Action conversion: VPT CameraHierarchical → MineDojo named dict
+# ROCKET-1 outputs {'buttons': int (0-8640), 'camera': int (0-120)} in the
+# VPT CameraHierarchical action space.  MineDojo env.step() expects individual
+# named keys ('forward', 'attack', 'camera', ...).  This mirrors what
+# MineStudio's simulator.entry.agent_action_to_env_action() does.
+# ---------------------------------------------------------------------------
+
+_ACTION_MAPPER: Optional[Any] = None
+_ACTION_TRANSFORMER: Optional[Any] = None
+
+
+def _get_action_converters():
+    """Lazy-init action mapper and transformer (avoid import cost at module load)."""
+    global _ACTION_MAPPER, _ACTION_TRANSFORMER
+    if _ACTION_MAPPER is None:
+        from minestudio.utils.vpt_lib.action_mapping import CameraHierarchicalMapping
+        from minestudio.utils.vpt_lib.actions import ActionTransformer
+        _ACTION_MAPPER = CameraHierarchicalMapping(n_camera_bins=11)
+        _ACTION_TRANSFORMER = ActionTransformer(camera_maxval=10, camera_binsize=2)
+    return _ACTION_MAPPER, _ACTION_TRANSFORMER
+
+
+def _vpt_to_minedojo(action: dict) -> dict:
+    """Convert ROCKET-1 VPT action to MineDojo env-compatible named action dict.
+
+    Input:  {'buttons': scalar tensor 0-8640, 'camera': scalar tensor 0-120}
+    Output: {'attack': 0|1, 'forward': 0|1, ..., 'camera': np.array([p, y])}
+    """
+    mapper, transformer = _get_action_converters()
+    ac = {
+        "buttons": action["buttons"].cpu().numpy() if hasattr(action["buttons"], "cpu")
+                   else np.asarray(action["buttons"]),
+        "camera":  action["camera"].cpu().numpy()  if hasattr(action["camera"],  "cpu")
+                   else np.asarray(action["camera"]),
+    }
+    factored = mapper.to_factored(ac)
+    return transformer.policy2env(factored)
+
 
 # ---------------------------------------------------------------------------
 # Model loading
@@ -180,7 +219,10 @@ class ROCKET1GatherOption:
 
         device = next(policy.parameters()).device
         obs = env.get_obs()
-        memory = policy.initial_state()
+        # Use None for first call — initial_state() returns squeezed tensors that
+        # cause a dim mismatch when passed back through get_action("*")'s single
+        # unsqueeze. Model creates correct internal state when state_in=None.
+        memory = None
         trajectory: list = []
 
         for _ in range(self.cfg.max_steps):
@@ -198,7 +240,11 @@ class ROCKET1GatherOption:
             rocket_input = {
                 "image": rgb,  # (H, W, 3) uint8
                 "segment": {
-                    "obj_id":   torch.tensor([self.obj_id], dtype=torch.int64).to(device),
+                    # obj_id must be a scalar (0-D) so that _batchify's 2x unsqueeze
+                    # produces (1, 1) — 2D — making interaction() output (1, 1, hiddim)
+                    # 3D.  A 1-D [val] would become (1,1,1) → (1,1,1,hiddim) 4D,
+                    # which then breaks the KV-cache cat in xf.py update_state.
+                    "obj_id":   torch.tensor(self.obj_id, dtype=torch.int64).to(device),
                     "obj_mask": torch.tensor(obj_mask, dtype=torch.uint8).to(device),
                 },
             }
@@ -210,8 +256,11 @@ class ROCKET1GatherOption:
                 deterministic=False,
             )
 
+            # Convert VPT {'buttons', 'camera'} → MineDojo named action dict
+            minedojo_action = _vpt_to_minedojo(action_dict)
+
             # Step environment
-            next_raw, _rew, done, _info = env.env.step(action_dict)
+            next_raw, _rew, done, _info = env.env.step(minedojo_action)
             env._last_raw = next_raw
             next_obs = env._convert(next_raw)
 
