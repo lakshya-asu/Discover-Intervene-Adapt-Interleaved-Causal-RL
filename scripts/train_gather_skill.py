@@ -83,14 +83,22 @@ def make_env(skill: str, seed: int, voxel_size: list):
     from src.dia.evgs_minedojo import make_minedojo_evgs
     from src.dia.options_minedojo import VoxelGatherWrapper, VoxelRewardWrapper
 
-    print(f"[env] making MineDojo open-ended  seed={seed}  biome=forest  voxel={voxel_size}")
+    # MineDojo voxel_size must be a dict with xmin/xmax/ymin/ymax/zmin/zmax.
+    # Convert (X, Y, Z) tuple to symmetric dict centered on the agent.
+    vs = voxel_size
+    voxel_dict = dict(
+        xmin=-(vs[0] // 2), xmax=vs[0] // 2,
+        ymin=-(vs[1] // 2), ymax=vs[1] // 2,
+        zmin=-(vs[2] // 2), zmax=vs[2] // 2,
+    )
+    print(f"[env] making MineDojo open-ended  seed={seed}  biome=forest  voxel_dict={voxel_dict}")
     raw_env = minedojo.make(
         task_id="open-ended",
         image_size=(64, 64),
         world_seed=str(seed),
         specified_biome="forest",
         use_voxel=True,
-        voxel_size=tuple(voxel_size),
+        voxel_size=voxel_dict,
         initial_mobs=[],
     )
 

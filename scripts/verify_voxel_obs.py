@@ -48,7 +48,10 @@ except ImportError as _dia_err:
 
 
 # Voxel grid shape expected from minedojo.make(..., voxel_size=(7,3,7))
-VOXEL_SIZE = (7, 3, 7)
+# MineDojo voxel_size must be a dict: xmin/xmax/ymin/ymax/zmin/zmax
+# Grid shape = (xmax-xmin+1, ymax-ymin+1, zmax-zmin+1) = (7, 3, 7)
+VOXEL_SIZE_DICT = dict(xmin=-3, xmax=3, ymin=-1, ymax=1, zmin=-3, zmax=3)
+VOXEL_SIZE = (7, 3, 7)   # kept for internal array math
 N_VOXEL_CELLS = VOXEL_SIZE[0] * VOXEL_SIZE[1] * VOXEL_SIZE[2]  # 147
 
 # Wood-type block names to look for (subset of SKILL_TARGETS['wood'])
@@ -244,7 +247,7 @@ def main():
             world_seed=str(args.seed),
             specified_biome="forest",
             use_voxel=True,
-            voxel_size=VOXEL_SIZE,
+            voxel_size=VOXEL_SIZE_DICT,
         )
 
         _flush(f"  env created: {type(env).__name__}")
