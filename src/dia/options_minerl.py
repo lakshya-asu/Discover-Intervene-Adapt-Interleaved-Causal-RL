@@ -52,10 +52,9 @@ except Exception:
 
 
 # ── Observation constants ─────────────────────────────────────────────────────
-OBS_H    = 64    # RGB height fed to CNN
-OBS_W    = 64    # RGB width  fed to CNN
-INV_DIM  = 9     # DIA variable vector length
-GOAL_DIM = 512   # CLIP ViT-B/32 text embedding dimension
+OBS_H   = 64    # RGB height fed to CNN
+OBS_W   = 64    # RGB width  fed to CNN
+INV_DIM = 9     # DIA variable vector length
 
 # ── Discrete action set for MineRL ────────────────────────────────────────────
 # Maps index → (action_key_changes, camera_delta)
@@ -140,41 +139,26 @@ class MineRLObsWrapper(gym.Wrapper if GYM_OK else object):
     Output: {'rgb': (64,64,3) uint8, 'inventory': (9,) float32}
     """
 
-    def __init__(self, env, evgs: EVGS,
-                 goal_embedding: Optional[np.ndarray] = None):
+    def __init__(self, env, evgs: EVGS):
         if GYM_OK:
             super().__init__(env)
         else:
             self.env = env
         self.evgs = evgs
         self._last_raw: Any = None
-        self._goal_embedding: Optional[np.ndarray] = (
-            goal_embedding.astype(np.float32) if goal_embedding is not None else None
-        )
 
         if GYM_OK and spaces is not None:
             obs_spaces: Dict[str, Any] = {
                 "rgb":       spaces.Box(0, 255, (OBS_H, OBS_W, 3), dtype=np.uint8),
                 "inventory": spaces.Box(0.0, 1.0, (INV_DIM,), dtype=np.float32),
             }
-            if goal_embedding is not None:
-                obs_spaces["clip_goal"] = spaces.Box(
-                    -1.0, 1.0, (GOAL_DIM,), dtype=np.float32
-                )
             self.observation_space = spaces.Dict(obs_spaces)
             self.action_space = spaces.Discrete(N_ACTIONS)
-
-    def set_goal_embedding(self, embed: np.ndarray) -> None:
-        """Update the CLIP goal embedding injected into every obs."""
-        self._goal_embedding = embed.astype(np.float32)
 
     def _convert(self, raw_obs: Any) -> Dict[str, np.ndarray]:
         rgb = self._resize_pov(raw_obs)
         inv = self.evgs.extract(raw_obs).astype(np.float32)
-        out: Dict[str, np.ndarray] = {"rgb": rgb, "inventory": inv}
-        if self._goal_embedding is not None:
-            out["clip_goal"] = self._goal_embedding
-        return out
+        return {"rgb": rgb, "inventory": inv}
 
     @staticmethod
     def _resize_pov(obs: Any) -> np.ndarray:
@@ -219,13 +203,10 @@ class MineRLObsWrapper(gym.Wrapper if GYM_OK else object):
         """Return current obs in wrapped format (for OptionPolicy compatibility)."""
         if self._last_raw is not None:
             return self._convert(self._last_raw)
-        out: Dict[str, np.ndarray] = {
+        return {
             "rgb":       np.zeros((OBS_H, OBS_W, 3), dtype=np.uint8),
             "inventory": np.zeros(INV_DIM, dtype=np.float32),
         }
-        if self._goal_embedding is not None:
-            out["clip_goal"] = self._goal_embedding
-        return out
 
     def get_raw_obs(self) -> Any:
         return self._last_raw
@@ -242,19 +223,15 @@ class ItemRewardWrapper(gym.Wrapper if GYM_OK else object):
     reward = +1.0       when target inventory variable goes 0 → 1
     reward = +0.1       each step the variable stays acquired
     reward = -0.005     per step (time pressure)
-    reward += clip_weight * cos_sim(frame, goal_embed)  (if clip_encoder provided)
     """
 
-    def __init__(self, env: MineRLObsWrapper, target_var_idx: int,
-                 clip_encoder=None, clip_weight: float = 0.1):
+    def __init__(self, env: MineRLObsWrapper, target_var_idx: int):
         if GYM_OK:
             super().__init__(env)
         else:
             self.env = env
-        self.target_idx   = target_var_idx
-        self._prev_val    = 0.0
-        self._clip_enc    = clip_encoder
-        self._clip_weight = clip_weight
+        self.target_idx = target_var_idx
+        self._prev_val  = 0.0
 
     def reset(self, **kwargs):
         obs = self.env.reset(**kwargs)
@@ -273,13 +250,6 @@ class ItemRewardWrapper(gym.Wrapper if GYM_OK else object):
         if curr_val > self._prev_val + 0.5:
             shaped += 1.0
         self._prev_val = curr_val
-
-        # ── CLIP dense reward ─────────────────────────────────────────────
-        if (self._clip_enc is not None
-                and "clip_goal" in obs
-                and "rgb" in obs):
-            clip_r = self._clip_enc.clip_reward(obs["rgb"], obs["clip_goal"])
-            shaped += self._clip_weight * clip_r
 
         return obs, ext_rew + shaped, done, info
 
@@ -302,7 +272,6 @@ class MineRLPPOOption(OptionPolicy):
         super().__init__(subgoal, cfg)
         self.deterministic = deterministic
         self._model = None
-        self._goal_embedding: Optional[np.ndarray] = None
         if model_or_path is not None:
             self.load(model_or_path)
 
@@ -314,10 +283,6 @@ class MineRLPPOOption(OptionPolicy):
         else:
             self._model = model_or_path
 
-    def set_goal_embedding(self, embed: np.ndarray) -> None:
-        """Store a CLIP goal embedding to push into the env wrapper before run()."""
-        self._goal_embedding = embed.astype(np.float32)
-
     def act(self, obs: Dict[str, np.ndarray]) -> int:
         if self._model is None:
             return int(np.random.randint(N_ACTIONS))
@@ -327,9 +292,6 @@ class MineRLPPOOption(OptionPolicy):
     def run(self, env, evgs: EVGS) -> Dict[str, Any]:
         if not hasattr(env, "get_obs"):
             raise TypeError("MineRLPPOOption.run requires env with get_obs()")
-        # Push VLM-derived CLIP goal into the env wrapper before stepping
-        if self._goal_embedding is not None and hasattr(env, "set_goal_embedding"):
-            env.set_goal_embedding(self._goal_embedding)
         obs     = env.get_obs()
         steps   = 0
         success = False

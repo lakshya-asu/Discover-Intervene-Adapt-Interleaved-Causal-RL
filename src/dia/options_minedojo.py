@@ -9,31 +9,27 @@ Architecture
 ------------
 MinedojoPPOOption
   - Wraps a pre-trained SB3 PPO model
-  - Preprocesses MineDojo's multimodal obs → compact (image + inventory + clip_goal) feature
+  - Preprocesses MineDojo's multimodal obs → compact (image + inventory) feature
   - Runs until subgoal achieved (var increases) or max_steps
   - Same .run(env, evgs) interface as CoinRun PixelStackPPOOption
 
 MinedojoObsWrapper  (gym.Wrapper)
   - Converts raw MineDojo obs dict → compact obs for SB3 training
-  - Outputs Dict space: {"rgb": Box(H,W,3), "inventory": Box(9,), ["clip_goal": Box(512,)]}
-  - clip_goal is a CLIP text embedding injected from outside (set via set_goal_embedding())
+  - Outputs Dict space: {"rgb": Box(H,W,3), "inventory": Box(9,)}
   - Used during training AND inference
 
 ItemRewardWrapper  (gym.RewardWrapper)
   - Adds +1 reward when target inventory item count increases
-  - Optionally adds CLIP cosine-similarity dense reward (clip_weight * cos_sim)
   - Used during PPO skill training
 
 Observation design for SB3
 ---------------------------
   "rgb":       (64, 64, 3) uint8  — downsampled from MineDojo's 160×256
   "inventory": (9,)       float32 — DIA variable vector from evgs_minedojo
-  "clip_goal": (512,)     float32 — CLIP text embedding (optional, only when use_clip=True)
 
 SB3 MultiInputPolicy handles this Dict space with:
   - CnnPolicy branch for "rgb"
   - MlpPolicy branch for "inventory"
-  - MlpPolicy branch for "clip_goal" (if present)
   All branches are concatenated before the action head.
 """
 from __future__ import annotations
@@ -63,7 +59,6 @@ except Exception:
 OBS_H   = 64    # RGB height fed to CNN
 OBS_W   = 64    # RGB width  fed to CNN
 INV_DIM = 9     # DIA variable vector length
-GOAL_DIM = 512  # CLIP ViT-B/32 text embedding dimension
 
 
 # ---------------------------------------------------------------------------
@@ -76,22 +71,16 @@ class MinedojoObsWrapper(gym.Wrapper if GYM_OK else object):
 
     Input:  raw MineDojo obs dict with 'rgb', 'inventory', ...
     Output: {'rgb': (64,64,3) uint8, 'inventory': (9,) float32}
-            + optionally 'clip_goal': (512,) float32 when goal_embedding is set.
 
-    Also exposes get_obs() and set_goal_embedding() for inference-time
-    VLM→CLIP goal injection.
+    Also exposes get_obs() for inference-time obs access.
     """
 
-    def __init__(self, env, evgs: EVGS,
-                 goal_embedding: Optional[np.ndarray] = None):
+    def __init__(self, env, evgs: EVGS):
         """
         Parameters
         ----------
-        env             : MineDojo environment
-        evgs            : EVGS instance for inventory extraction
-        goal_embedding  : [512] float32 CLIP text embedding (optional).
-                          If provided, 'clip_goal' is added to the obs space.
-                          Can be updated at any time via set_goal_embedding().
+        env  : MineDojo environment
+        evgs : EVGS instance for inventory extraction
         """
         if GYM_OK:
             super().__init__(env)
@@ -99,37 +88,18 @@ class MinedojoObsWrapper(gym.Wrapper if GYM_OK else object):
             self.env = env
         self.evgs = evgs
         self._last_obs: Any = None
-        self._goal_embedding: Optional[np.ndarray] = (
-            goal_embedding.astype(np.float32) if goal_embedding is not None else None
-        )
 
         if GYM_OK and spaces is not None:
             obs_spaces: Dict[str, Any] = {
                 "rgb":       spaces.Box(0, 255, (OBS_H, OBS_W, 3), dtype=np.uint8),
                 "inventory": spaces.Box(0.0, 1.0, (INV_DIM,), dtype=np.float32),
             }
-            if goal_embedding is not None:
-                obs_spaces["clip_goal"] = spaces.Box(
-                    -1.0, 1.0, (GOAL_DIM,), dtype=np.float32
-                )
             self.observation_space = spaces.Dict(obs_spaces)
-
-    def set_goal_embedding(self, embed: np.ndarray) -> None:
-        """
-        Update the CLIP goal embedding injected into every obs.
-
-        Called at inference time by the transfer script after the VLM
-        produces a new instruction for the current skill.
-        """
-        self._goal_embedding = embed.astype(np.float32)
 
     def _convert(self, raw_obs: Any) -> Dict[str, np.ndarray]:
         rgb = self._get_rgb(raw_obs)
         inv = self.evgs.extract(raw_obs).astype(np.float32)
-        out: Dict[str, np.ndarray] = {"rgb": rgb, "inventory": inv}
-        if self._goal_embedding is not None:
-            out["clip_goal"] = self._goal_embedding
-        return out
+        return {"rgb": rgb, "inventory": inv}
 
     @staticmethod
     def _get_rgb(obs: Any) -> np.ndarray:
@@ -200,13 +170,10 @@ class MinedojoObsWrapper(gym.Wrapper if GYM_OK else object):
     def get_obs(self) -> Dict[str, np.ndarray]:
         if self._last_obs is not None:
             return self._convert(self._last_obs)
-        out: Dict[str, np.ndarray] = {
+        return {
             "rgb":       np.zeros((OBS_H, OBS_W, 3), dtype=np.uint8),
             "inventory": np.zeros(INV_DIM, dtype=np.float32),
         }
-        if self._goal_embedding is not None:
-            out["clip_goal"] = self._goal_embedding
-        return out
 
     def get_raw_obs(self) -> Any:
         """Return the most recent raw (unwrapped) MineDojo observation."""
@@ -253,35 +220,23 @@ class ItemRewardWrapper(gym.Wrapper if GYM_OK else object):
     reward = +1.0       when target inventory variable goes from 0 → 1
     reward = +0.1       each step the variable stays acquired (sustain signal)
     reward = -0.005     per step (small survival pressure)
-    reward += clip_weight * cos_sim(frame, goal_embed)   (if clip_encoder provided)
-
-    The CLIP dense reward provides a gradient signal toward the visual goal
-    before the item reward fires, making sparse skill acquisition much easier
-    to learn.
 
     Used during train_minedojo_skill.py to train each PPO skill.
     """
 
-    def __init__(self, env: MinedojoObsWrapper, target_var_idx: int,
-                 clip_encoder=None, clip_weight: float = 0.1):
+    def __init__(self, env: MinedojoObsWrapper, target_var_idx: int):
         """
         Parameters
         ----------
-        env             : MinedojoObsWrapper
-        target_var_idx  : index into the inventory vector for the target item
-        clip_encoder    : CLIPGoalEncoder instance (optional).
-                          If provided, CLIP cosine-similarity is added to reward.
-                          The goal embedding is read from env._goal_embedding.
-        clip_weight     : weight for CLIP reward term (default 0.1)
+        env            : MinedojoObsWrapper
+        target_var_idx : index into the inventory vector for the target item
         """
         if GYM_OK:
             super().__init__(env)
         else:
             self.env = env
-        self.target_idx   = target_var_idx
-        self._prev_val    = 0.0
-        self._clip_enc    = clip_encoder
-        self._clip_weight = clip_weight
+        self.target_idx = target_var_idx
+        self._prev_val  = 0.0
 
     def reset(self, **kwargs):
         obs = self.env.reset(**kwargs)
@@ -301,13 +256,6 @@ class ItemRewardWrapper(gym.Wrapper if GYM_OK else object):
             shaped += 1.0   # just acquired — big bonus
         self._prev_val = curr_val
 
-        # ── CLIP dense reward ─────────────────────────────────────────────
-        if (self._clip_enc is not None
-                and "clip_goal" in obs
-                and "rgb" in obs):
-            clip_r = self._clip_enc.clip_reward(obs["rgb"], obs["clip_goal"])
-            shaped += self._clip_weight * clip_r
-
         return obs, ext_rew + shaped, done, info
 
 
@@ -323,10 +271,9 @@ class MinedojoPPOOption(OptionPolicy):
     deterministic — use deterministic policy (True for exploitation)
 
     set_directive(actions) — prepend VLM-supplied raw actions before PPO takes over
-    set_goal_embedding(embed) — update the CLIP goal injected into the env's obs
 
     run(env, evgs):
-        env must be a MinedojoObsWrapper (has get_obs() and set_goal_embedding()).
+        env must be a MinedojoObsWrapper (has get_obs()).
     """
 
     def __init__(self, subgoal: Subgoal, cfg: OptionConfig,
@@ -336,7 +283,6 @@ class MinedojoPPOOption(OptionPolicy):
         self.deterministic = deterministic
         self._model = None
         self._directive: List[int] = []
-        self._goal_embedding: Optional[np.ndarray] = None
 
         if model_or_path is not None:
             self.load(model_or_path)
@@ -357,14 +303,6 @@ class MinedojoPPOOption(OptionPolicy):
         """
         self._directive = list(actions)
 
-    def set_goal_embedding(self, embed: np.ndarray) -> None:
-        """
-        Store a CLIP goal embedding that will be injected into the env's obs
-        at the start of run().  Called by the transfer script after the VLM
-        produces an instruction for the current skill.
-        """
-        self._goal_embedding = embed.astype(np.float32)
-
     def act(self, obs: Dict[str, np.ndarray]) -> Any:
         """Predict action for a single obs dict (pops directive first)."""
         if self._directive:
@@ -379,15 +317,9 @@ class MinedojoPPOOption(OptionPolicy):
         Execute the PPO skill until subgoal achieved or max_steps exceeded.
 
         env must expose get_obs() → dict obs compatible with MinedojoObsWrapper.
-        If a goal_embedding is set, it is pushed to env.set_goal_embedding()
-        before the loop starts so that every step's obs includes 'clip_goal'.
         """
         if not hasattr(env, "get_obs"):
             raise TypeError("MinedojoPPOOption.run requires env with get_obs()")
-
-        # Push VLM-derived CLIP goal into the env wrapper before stepping
-        if self._goal_embedding is not None and hasattr(env, "set_goal_embedding"):
-            env.set_goal_embedding(self._goal_embedding)
 
         obs     = env.get_obs()
         steps   = 0
@@ -543,29 +475,18 @@ class MineDojoObsWrapper:
     Compatible with MinedojoPPOOption.run(env, evgs) interface.
     """
 
-    def __init__(self, env, evgs: EVGS,
-                 goal_embedding: Optional[np.ndarray] = None):
+    def __init__(self, env, evgs: EVGS):
         """
         Parameters
         ----------
-        env            : raw MineDojo environment
-        evgs           : EVGS instance (evgs_minedojo.make_minedojo_evgs())
-        goal_embedding : optional (512,) CLIP embedding; adds 'clip_goal' to obs
+        env  : raw MineDojo environment
+        evgs : EVGS instance (evgs_minedojo.make_minedojo_evgs())
         """
         self.env = env
         self.evgs = evgs
         self._last_raw: Any = None
-        self._goal_embedding: Optional[np.ndarray] = (
-            goal_embedding.astype(np.float32) if goal_embedding is not None else None
-        )
         # Cache the no-op action for action translation
         self._no_op_action: Optional[dict] = None
-
-    # -- Goal embedding --
-
-    def set_goal_embedding(self, embed: np.ndarray) -> None:
-        """Update the CLIP goal embedding injected into every obs."""
-        self._goal_embedding = embed.astype(np.float32)
 
     # -- Core interface --
 
@@ -626,13 +547,10 @@ class MineDojoObsWrapper:
         """Return current wrapped obs (for compatibility with OptionPolicy.run)."""
         if self._last_raw is not None:
             return self._convert(self._last_raw)
-        out: Dict[str, np.ndarray] = {
+        return {
             "rgb":       np.zeros((OBS_H, OBS_W, 3), dtype=np.uint8),
             "inventory": np.zeros(INV_DIM, dtype=np.float32),
         }
-        if self._goal_embedding is not None:
-            out["clip_goal"] = self._goal_embedding
-        return out
 
     def get_raw_obs(self) -> Any:
         """Return the last raw MineDojo observation."""
@@ -644,10 +562,7 @@ class MineDojoObsWrapper:
         """Convert raw MineDojo obs → wrapped obs dict."""
         rgb = self._get_rgb(raw_obs)
         inv = self.evgs.extract(raw_obs).astype(np.float32)
-        out: Dict[str, np.ndarray] = {"rgb": rgb, "inventory": inv}
-        if self._goal_embedding is not None:
-            out["clip_goal"] = self._goal_embedding
-        return out
+        return {"rgb": rgb, "inventory": inv}
 
     def _get_rgb(self, raw_obs: Any) -> np.ndarray:
         """
