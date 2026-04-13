@@ -83,6 +83,11 @@ from dia.options_minerl import (
     SkillScriptedOption,
     MineRLObsWrapper,
 )
+try:
+    from dia.options_rocket1 import ROCKET1GatherOption, is_rocket1_available
+    _ROCKET1_IMPORT_OK = True
+except ImportError:
+    _ROCKET1_IMPORT_OK = False
 
 # ── Variable index mapping ───────────────────────────────────────────────────
 _VAR_IDX: Dict[str, int] = {n: i for i, n in enumerate(VAR_NAMES)}
@@ -199,11 +204,22 @@ def update_pcg_from_trajectory(
 # Environment creation with MineDojo primary, MineRL fallback
 # ---------------------------------------------------------------------------
 
-def make_env_minedojo(evgs) -> tuple[Any, str]:
+_GATHER_SKILLS: frozenset = frozenset(
+    n for n in VAR_NAMES if n not in CRAFT_SKILLS
+)
+
+
+def make_env_minedojo(evgs, image_size: tuple = (64, 64)) -> tuple[Any, str]:
     """
     Create and wrap a 3D Minecraft environment.
 
     Attempts MineDojo first; falls back to MineRL if MineDojo is unavailable.
+
+    Parameters
+    ----------
+    image_size : (H, W) tuple
+        Passed to minedojo.make(). Use (224, 224) with --backbone rocket1 so
+        ROCKET-1's SAM-2 visual grounding operates at native training resolution.
 
     Returns
     -------
@@ -214,7 +230,7 @@ def make_env_minedojo(evgs) -> tuple[Any, str]:
     # ── Try MineDojo ─────────────────────────────────────────────────────────
     try:
         import minedojo
-        raw = minedojo.make(task_id="open-ended", image_size=(64, 64))
+        raw = minedojo.make(task_id="open-ended", image_size=image_size)
         wrapped = MinedojoObsWrapper(raw, evgs)
         return wrapped, _MINEDOJO_ENV_ID
     except Exception as md_exc:
@@ -288,6 +304,7 @@ def run_experiment(args) -> Dict[str, Any]:
 
     # ── Load skill options ────────────────────────────────────────────────
     options: Dict[int, Any] = {}
+    backbone = getattr(args, "backbone", "bc")  # default bc if arg absent
 
     for var_idx, var_name in enumerate(VAR_NAMES):
         sg  = Subgoal(var_index=var_idx, predicate=Predicate.UP)
@@ -296,14 +313,32 @@ def run_experiment(args) -> Dict[str, Any]:
         if args.mode == "transfer":
             if var_name in CRAFT_SKILLS:
                 opt = InventoryConditionedCraftOption(sg, cfg, var_name)
-                print(f"  [{var_name}] craft option (deterministic)")
+                print(f"  [{var_name}] InventoryConditionedCraftOption (deterministic)")
+            elif var_name in _GATHER_SKILLS and backbone == "rocket1":
+                if _ROCKET1_IMPORT_OK:
+                    opt = ROCKET1GatherOption(sg, cfg, var_name)
+                    print(f"  [{var_name}] ROCKET1GatherOption")
+                else:
+                    # options_rocket1 import failed — fall through to BC
+                    print(f"  [{var_name}] rocket1 import failed — falling back to BC")
+                    pt_path = os.path.join(args.bc_dir or "", f"{var_name}.pt")
+                    opt = load_bc_option(var_name, pt_path, cfg) or SkillScriptedOption(sg, cfg, var_name)
             else:
-                pt_path = os.path.join(args.bc_dir, f"{var_name}.pt")
-                opt     = load_bc_option(var_name, pt_path, cfg)
-                if opt is None:
+                # backbone == "bc" or "scripted"
+                if backbone != "scripted" and args.bc_dir:
+                    pt_path = os.path.join(args.bc_dir, f"{var_name}.pt")
+                    opt = load_bc_option(var_name, pt_path, cfg)
+                    if opt is None:
+                        opt = SkillScriptedOption(sg, cfg, var_name)
+                        if args.verbose:
+                            print(f"  [{var_name}] BC not found — using SkillScriptedOption")
+                    else:
+                        if args.verbose:
+                            print(f"  [{var_name}] BCOptionWrapper")
+                else:
                     opt = SkillScriptedOption(sg, cfg, var_name)
                     if args.verbose:
-                        print(f"  [{var_name}] BC not found — using SkillScriptedOption")
+                        print(f"  [{var_name}] SkillScriptedOption")
         else:
             # Baseline: scripted options only
             opt = SkillScriptedOption(sg, cfg, var_name)
@@ -328,9 +363,12 @@ def run_experiment(args) -> Dict[str, Any]:
         return result
 
     # ── Create environment ────────────────────────────────────────────────
-    print(f"\nCreating 3D Minecraft env (MineDojo primary, MineRL fallback)...")
+    # Use 224×224 for ROCKET-1 so SAM-2 operates at training resolution;
+    # 64×64 suffices for BC policies and scripted options.
+    img_size = (224, 224) if backbone == "rocket1" else (64, 64)
+    print(f"\nCreating 3D Minecraft env (image_size={img_size}, MineDojo primary, MineRL fallback)...")
     try:
-        env, env_id = make_env_minedojo(evgs)
+        env, env_id = make_env_minedojo(evgs, image_size=img_size)
     except Exception as exc:
         print(f"ERROR: could not create any 3D env: {exc}")
         return {
@@ -492,6 +530,14 @@ def main() -> Dict[str, Any]:
              "(default: pcg_2d.npy)",
     )
     ap.add_argument(
+        "--backbone", type=str, default="rocket1",
+        choices=["rocket1", "bc", "scripted"],
+        help="Gather policy backbone for transfer mode: "
+             "rocket1 (ROCKET-1 pre-trained, 224×224), "
+             "bc (MineRL BC policies, 64×64), "
+             "scripted (heuristic fallback)  (default: rocket1)",
+    )
+    ap.add_argument(
         "--bc_dir", type=str, default="data/minerl_policies",
         help="Directory containing <skill>.pt BC policy files. Transfer mode only.  "
              "(default: data/minerl_policies)",
@@ -527,6 +573,7 @@ def main() -> Dict[str, Any]:
 
     print("run_transfer_minedojo.py")
     print(f"  mode                : {args.mode}")
+    print(f"  backbone            : {args.backbone}")
     print(f"  seed                : {args.seed}")
     print(f"  pcg_path            : {args.pcg_path}")
     print(f"  bc_dir              : {args.bc_dir}")
