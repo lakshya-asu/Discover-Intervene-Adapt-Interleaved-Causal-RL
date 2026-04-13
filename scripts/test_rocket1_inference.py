@@ -87,11 +87,23 @@ def main() -> int:
     # ------------------------------------------------------------------
     # 4. Dummy inference — (1, 3, 224, 224) float32
     # ------------------------------------------------------------------
-    print("\n[4] Dummy inference  shape=(1,3,224,224)")
+    print("\n[4] Dummy inference  image=(224,224,3) uint8 + full-frame mask")
+    import torch
     dummy_rgb = np.random.randint(0, 256, (224, 224, 3), dtype=np.uint8)
-    rgb_input = np.transpose(dummy_rgb, (2, 0, 1))[None].astype(np.float32) / 255.0
+    dummy_mask = np.ones((224, 224), dtype=np.uint8)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    memory = policy.initial_state()
+    rocket_input = {
+        "image": dummy_rgb,
+        "segment": {
+            "obj_id":   torch.tensor([2], dtype=torch.int64).to(device),
+            "obj_mask": torch.tensor(dummy_mask, dtype=torch.uint8).to(device),
+        },
+    }
     try:
-        action, hidden = policy.get_action(rgb_input, "chop a tree", hidden=None)
+        action, memory = policy.get_action(
+            input=rocket_input, state_in=memory, input_shape="*", deterministic=False
+        )
         results.append(check("get_action() returns without error", True))
     except Exception as e:
         import traceback
