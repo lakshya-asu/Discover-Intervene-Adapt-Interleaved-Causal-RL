@@ -156,11 +156,14 @@ Fix: unwrap one level with `getattr(env, "_env", env)` before looking up `.env`.
 | it2 | 7 | ❌ | ❌ | Baseline |
 | it3 | 7 | ❌ | ❌ | +step budget |
 | it4 | **8** (s1) | ❌ | ✅ byproduct | +staircase primer |
-| it5 | 7 | ❌ | ❌ | min_qty regression |
-| it6 | **8** (s1) | ✅ spawn | ❌ | +force-attack scan |
+| it5 | 7 | ❌ | ❌ | min_qty=5 (wood over-farms but agent behaviour quality high) |
+| it6 | **8** (s1) | ✅ spawn | ❌ | min_qty=3, force-attack scan — agent visibly dumber |
+| it7 | 6/4 | ❌ | ❌ | +video/torches/effects; /give bug from wrapper |
 | ft† | **8** (s0) | ❌ | ✅ spawn | Fine-tuned GROOT ckpt |
+| **it8** | TBD | TBD | TBD | **Reverted to it5 logic** + it7 additions |
 
 †`ft`: separate run with fine-tuned GROOT checkpoint, seed 0.
 
 **Best legitimate performance:** it4 seed 1 (ironore found by staircase, not spawn luck).  
-**Closest to SOTA path:** Getting ironore reliably requires either consistent staircase geometry hitting ore veins, or active cave detection.
+**Best agent behaviour quality:** it4/it5 — GROOT's visual goal-following during scan sweep produced purposeful ore-seeking. Force-attack override in it6 removed this and made the agent dumber.  
+**Active codebase (it8):** it5 logic (wood min_qty=5, GROOT controls scan attack) + torches + water/fire effects + video recording + /give wrapper fix.

@@ -112,15 +112,15 @@ _GATHER_PREREQS: Dict[str, List[str]] = {
 
 # Minimum quantities to gather before declaring a gather skill "done".
 # These reflect downstream craft requirements:
-#   wood   → 3 logs: 12 planks → enough handles for all pickaxes + buffer
-#            (was 5, but 2883-step over-farming wasted budget — 3 is sufficient)
+#   wood   → 5 logs: 20 planks → safe buffer for all pickaxes + sticks
+#            (reverted to 5; it6 min=3 correlated with weaker agent behaviour)
 #   stone  → 11 cobblestone: furnace (8) + stonepickaxe (3); mostly found as
 #            byproduct so min_qty rarely limits explicit stone attempts
 #   ironore→ 3 ore → 3 ingots → iron_pickaxe (3 ingots needed)
 #   coal   → 1 is fine (one coal = 8 smelt operations)
 #   diamond→ rare; 1 is the target
 _GATHER_MIN_QTY: Dict[str, int] = {
-    "wood":    3,
+    "wood":    5,
     "stone":   11,
     "coal":    1,
     "ironore": 3,

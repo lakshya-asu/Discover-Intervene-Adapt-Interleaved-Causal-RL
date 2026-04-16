@@ -200,20 +200,19 @@ class GrootExecutor:
     #   150 uninterrupted steps = deepest possible descent, crossing more ore veins.
     #   (Pausing for item collection reduced depth and caused ironore regression.)
     #
-    # Subgoal 2 — Forced mine sweep for ore (steps 153-199):
-    #   Camera pitches back toward horizontal and sweeps left/right while attack
-    #   is FORCED ON.  This makes the agent aggressively mine whatever block the
-    #   camera is pointing at during the sweep — coal/ironore seams in the walls
-    #   get broken and dropped items auto-collect at the agent's new depth position.
-    #   GROOT controls forward/sprint (may advance into mined blocks).
+    # Subgoal 2 — Visual scan for ore (steps 153-199):
+    #   Camera pitches back toward horizontal and sweeps left/right.  GROOT
+    #   controls attack — it visually identifies ore seams and attacks them.
+    #   This is the it5 behaviour: GROOT's visual goal-following drives attack
+    #   once it is at cave depth and can see ore-matching blocks.
     _UNDERGROUND_SWEEP: List[Tuple[float, float, int, int]] = (
         [(15.0, 0.0,  0, 0)] * 3    # pitch down to +45°  (GROOT buttons)
         + [(0.0, 0.0,  1, 1)] * 150 # FORCED dig staircase at 45° pitch
-        + [(0.0, 15.0, 1, 0)] * 8   # sweep right + FORCE attack (mine cave wall)
-        + [(0.0, -15.0,1, 0)] * 8   # sweep left  + FORCE attack
-        + [(0.0, 15.0, 1, 0)] * 4   # sweep right again (widen search arc)
+        + [(0.0, 15.0, 0, 0)] * 8   # sweep right (GROOT controls attack)
+        + [(0.0, -15.0,0, 0)] * 8   # sweep left  (GROOT controls attack)
+        + [(0.0, 15.0, 0, 0)] * 4   # sweep right again
         + [(-5.0, 0.0, 0, 0)] * 5   # restore pitch toward horizontal
-        + [(0.0, 0.0,  1, 0)] * 22  # face forward + FORCE attack (mine ahead)
+        + [(0.0, 0.0,  0, 0)] * 22  # face forward (GROOT controls attack)
     )
 
     def _run_primer(
