@@ -2,16 +2,15 @@
 """
 Full tech-tree playthrough demo recorder.
 
-Records human demonstrations of every skill in the DIA Minecraft tech tree,
-one skill at a time, in the correct causal order. Each segment is saved as:
+Records one continuous human demonstration per seed.  Play the full tech tree
+from bare hands to diamond — the world advances to the next seed automatically
+when a diamond appears in your inventory.  Frames, actions, and language
+annotations are saved as one bundle per seed.
 
-  <out_dir>/<skill>/<tag>.mp4               — reference video clip (GROOT conditioning)
-  <out_dir>/<skill>/<tag>_bc.npz           — obs + action arrays (BC fine-tuning)
-  <out_dir>/<skill>/<tag>_annotations.json — frame-level bookmarks (optional)
-
-The player completes each skill in a single live session. Between skills the
-environment is reset and pre-loaded with the required prerequisites (crafted
-tools given via /give) so the player can focus on the skill being demonstrated.
+Output per seed (in --out_dir/seed_<N>/):
+  playthrough.mp4               — full recording
+  playthrough_bc.npz            — obs + action arrays (BC fine-tuning)
+  playthrough_annotations.json  — labeled segments (F5 annotations)
 
 Controls:
   W/A/S/D        — move
@@ -24,28 +23,29 @@ Controls:
   1-9            — hotbar slot
   Q              — drop item
   ---
-  F5             — drop annotation bookmark at current frame (can press multiple times)
-  F10            — start recording this skill's segment
-  F11            — stop + save, advance to next skill
+  F5             — annotate: describe what you're about to do
   F12            — quit
 
 Annotation segments (F5):
   Press F5 to END the current labeled segment and START a new one.
   The game pauses, the terminal prompts you to type a description of what you're
-  about to do (e.g. "walking toward coal vein", "mining coal with pickaxe", "placing torch").
+  about to do (e.g. "walking toward coal vein", "mining coal with pickaxe").
   Press Enter — game resumes and all frames until the next F5 are tagged with that label.
   Segments are saved as {"start_frame": N, "end_frame": M, "label": "..."} in a JSON
   sidecar alongside the MP4 and BC npz.  Use them to slice targeted fine-tuning clips.
 
+Seed advancement:
+  The seed advances automatically when a diamond appears in your inventory.
+  Press F12 to quit at any time.
+
 Usage:
   conda run -n dia-minecraft python scripts/record_playthrough_demos.py \\
-      --out_dir data/playthrough_demos \\
-      --seed 0
+      --out_dir data/playthrough_demos
 
-  # Resume from a specific skill if a session was interrupted:
+  # Resume from a specific seed:
   conda run -n dia-minecraft python scripts/record_playthrough_demos.py \\
       --out_dir data/playthrough_demos \\
-      --seed 0 --start_skill ironore
+      --start_seed 3
 """
 from __future__ import annotations
 
@@ -54,7 +54,6 @@ import json
 import logging
 import os
 import sys
-import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -161,258 +160,130 @@ _SKILL_DESCRIPTIONS: Dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
-# Input capture (pynput)
+# Input capture — MineStudio PlayCallback (exclusive mouse, proper key events)
 # ---------------------------------------------------------------------------
-
-from pynput import keyboard as _kb, mouse as _ms  # noqa: E402
-
-_KEY_STATE: Dict[str, bool] = {
-    "forward": False, "back": False, "left": False, "right": False,
-    "jump": False, "sneak": False, "sprint": False,
-    "attack": False, "use": False, "drop": False, "inventory": False,
-}
-_HOTBAR: int = 1
-_mouse_dx: float = 0.0
-_mouse_dy: float = 0.0
-_mouse_lock = threading.Lock()
-_recording: bool = False
-_advance: bool = False   # F11 — save and go to next skill
-_quit: bool = False
-_prev_mouse: Optional[Tuple[float, float]] = None
-
-# ---------------------------------------------------------------------------
-# Annotation state
+# PlayCallback creates a separate pyglet window that:
+#   - Captures the mouse exclusively (cursor locked to window)
+#   - Reads WASD / Space / Shift / Ctrl / mouse buttons / mouse delta
+#   - Returns actions in env format (individual key dict)
+# We subclass it to add F5 (annotate) and F12 (quit) detection.
 #
-# Annotations are LABELED SEGMENTS, not single-frame bookmarks.
-# Workflow:
-#   1. Press F5 → game pauses, terminal prompts for description of what
-#      you're about to do ("chopping tree", "mining coal vein", etc.)
-#   2. Type description + Enter → recording resumes under that label
-#   3. Press F5 again → ends the current segment, prompts for the next one
-#
-# Each segment saved: {"start_frame": N, "end_frame": M, "label": "..."}
-# ---------------------------------------------------------------------------
-_annotation_segments: List[Dict] = []   # completed labeled segments
-_annot_lock = threading.Lock()
-_current_label: Optional[str] = None    # label currently active (or None)
-_label_start_frame: int = 0             # frame where current label began
-_current_frame: int = 0                 # written by the main loop each frame
-_waiting_for_label: bool = False        # F5 sets this; main loop reads and clears
-_in_label_input: bool = False           # True while main loop is in input()
+# Controls printed on startup:
+#   C            — capture / release mouse in the game window
+#   Left Ctrl+C  — close window
+#   Esc          — enter chat/command mode
+#   F5           — annotate: describe what you're doing
+#   F12          — quit recording session
 
+class _RecordingPlayCallback:
+    """Wraps PlayCallback's GUI for direct use from the game loop.
 
-def _on_key_press(key: Any) -> None:
-    global _recording, _advance, _quit, _HOTBAR, _waiting_for_label
-    try:
-        if key == _kb.Key.f5:
-            if _in_label_input:
-                return  # ignore F5 while user is typing
-            if _recording:
-                _waiting_for_label = True
-                # log will appear after the input() prompt clears
+    NOT registered with MinecraftSim as a callback — env.reset() and
+    env.step() run their own internal callback chains unmodified.
+    We drive the GUI manually each tick: dispatch events, read human
+    actions, push rendered frames.
+
+    Controls printed by PlayCallback on startup:
+      C            — capture / release mouse
+      Left Ctrl+C  — close window / quit
+      F5           — annotate current segment
+      F12          — quit recording session
+    """
+
+    def __init__(self) -> None:
+        from minestudio.simulator.callbacks.play import PlayCallback
+        self._cb = PlayCallback(agent_generator=None)
+        self.f5_pressed: bool = False
+        self.quit_pressed: bool = False
+
+    # ------------------------------------------------------------------
+    # Per-tick interface (called from game loop)
+    # ------------------------------------------------------------------
+
+    def get_action(self) -> Dict:
+        """Dispatch GUI events and return the current human action dict."""
+        gui = self._cb.gui
+        gui.window.dispatch_events()
+
+        released = gui._capture_all_keys()
+        if "F5" in released:
+            self.f5_pressed = True
+        if "F12" in released:
+            self.quit_pressed = True
+            logger.info("[recorder] *** QUIT (F12) ***")
+        # 'C' toggles exclusive mouse; Ctrl+C quits
+        if "C" in released:
+            if not (gui.modifiers & gui.key.MOD_CTRL):
+                gui.capture_mouse = not gui.capture_mouse
+                gui.window.set_mouse_visible(not gui.capture_mouse)
+                gui.window.set_exclusive_mouse(gui.capture_mouse)
             else:
-                logger.info("[recorder] F5: not recording — press F10 first")
-            return
-        if key == _kb.Key.f10:
-            if not _recording:
-                _recording = True
-                logger.info("[recorder] *** RECORDING STARTED ***")
-            return
-        if key == _kb.Key.f11:
-            _recording = False
-            _advance = True
-            logger.info("[recorder] *** RECORDING STOPPED — saving & advancing ***")
-            return
-        if key == _kb.Key.f12:
-            _recording = False
-            _quit = True
-            logger.info("[recorder] *** QUIT ***")
-            return
-    except Exception:
-        pass
+                self.quit_pressed = True
+                logger.info("[recorder] *** QUIT (Ctrl-C) ***")
 
-    try:
-        ch = key.char.lower() if hasattr(key, "char") and key.char else None
-    except Exception:
-        ch = None
+        return gui._get_human_action()
 
-    if ch == "w":   _KEY_STATE["forward"] = True
-    elif ch == "s": _KEY_STATE["back"]    = True
-    elif ch == "a": _KEY_STATE["left"]    = True
-    elif ch == "d": _KEY_STATE["right"]   = True
-    elif ch == "e": _KEY_STATE["inventory"] = True
-    elif ch == "q": _KEY_STATE["drop"]    = True
-    elif ch in "123456789": _HOTBAR = int(ch)
+    def update_display(self, info: Dict) -> None:
+        """Push the latest observation frame to the GUI."""
+        try:
+            self._cb.gui._update_image(info)
+        except Exception:
+            pass
 
-    try:
-        if key == _kb.Key.space: _KEY_STATE["jump"]   = True
-        elif key == _kb.Key.shift: _KEY_STATE["sneak"] = True
-        elif key == _kb.Key.ctrl:  _KEY_STATE["sprint"] = True
-    except Exception:
-        pass
+    def show_resetting(self) -> None:
+        """Show 'Resetting environment...' message (call before env.reset())."""
+        try:
+            self._cb.gui.reset_gui()
+        except Exception:
+            pass
 
+    # ------------------------------------------------------------------
+    # Window management
+    # ------------------------------------------------------------------
 
-def _on_key_release(key: Any) -> None:
-    try:
-        ch = key.char.lower() if hasattr(key, "char") and key.char else None
-    except Exception:
-        ch = None
+    def position_window(self, x: int = 1080, y: int = 546,
+                        w: int = 1280, h: int = 720) -> None:
+        """Move and resize the pyglet game window onto the center monitor."""
+        try:
+            win = self._cb.gui.window
+            win.set_size(w, h)
+            win.set_location(x, y)
+            logger.info("PlayCallback window at (%d,%d) %dx%d", x, y, w, h)
+        except Exception as exc:
+            logger.warning("Could not position game window: %s", exc)
 
-    if ch == "w":   _KEY_STATE["forward"] = False
-    elif ch == "s": _KEY_STATE["back"]    = False
-    elif ch == "a": _KEY_STATE["left"]    = False
-    elif ch == "d": _KEY_STATE["right"]   = False
-    elif ch == "e": _KEY_STATE["inventory"] = False
-    elif ch == "q": _KEY_STATE["drop"]    = False
+    def release_mouse(self) -> None:
+        """Release exclusive mouse capture (call before terminal input())."""
+        try:
+            self._cb.gui.window.set_exclusive_mouse(False)
+            self._cb.gui.window.set_mouse_visible(True)
+        except Exception:
+            pass
 
-    try:
-        if key == _kb.Key.space: _KEY_STATE["jump"]   = False
-        elif key == _kb.Key.shift: _KEY_STATE["sneak"] = False
-        elif key == _kb.Key.ctrl:  _KEY_STATE["sprint"] = False
-    except Exception:
-        pass
+    def capture_mouse(self) -> None:
+        """Re-acquire exclusive mouse capture (call after terminal input())."""
+        try:
+            self._cb.gui.window.set_exclusive_mouse(True)
+            self._cb.gui.window.set_mouse_visible(False)
+        except Exception:
+            pass
 
-
-def _on_mouse_click(x: float, y: float, button: Any, pressed: bool) -> None:
-    if button == _ms.Button.left:  _KEY_STATE["attack"] = pressed
-    elif button == _ms.Button.right: _KEY_STATE["use"]  = pressed
-
-
-def _on_mouse_move(x: float, y: float) -> None:
-    global _mouse_dx, _mouse_dy, _prev_mouse
-    if _prev_mouse is not None:
-        dx = x - _prev_mouse[0]
-        dy = y - _prev_mouse[1]
-        with _mouse_lock:
-            _mouse_dx += dx * 0.1
-            _mouse_dy += dy * 0.1
-    _prev_mouse = (x, y)
-
-
-def _build_action(noop: Dict) -> Dict:
-    import copy
-    act = copy.deepcopy(noop)
-    for k in ("forward", "back", "left", "right", "jump", "sneak",
-              "sprint", "attack", "use", "drop", "inventory"):
-        if k in act:
-            act[k] = int(_KEY_STATE[k])
-
-    with _mouse_lock:
-        dx, dy = _mouse_dx, _mouse_dy
-        globals()["_mouse_dx"] = 0.0
-        globals()["_mouse_dy"] = 0.0
-
-    dx = float(np.clip(dx, -30.0, 30.0))
-    dy = float(np.clip(dy, -30.0, 30.0))
-    if "camera" in act and hasattr(act["camera"], "__len__"):
-        act["camera"] = np.array([dy, dx], dtype=np.float32)
-
-    slot_key = f"hotbar.{_HOTBAR}"
-    if slot_key in act:
-        act[slot_key] = 1
-
-    return act
 
 # ---------------------------------------------------------------------------
 # Env helpers
 # ---------------------------------------------------------------------------
-
-_WINDOW_KEEPER_RUNNING = False
-
-
-# Center monitor position (DP-0 top-left corner at 1080,546).
-# We only MOVE the window — never resize it — so MineStudio's internal
-# frame capture stays consistent with the native window dimensions.
-_MC_WIN_X = 1080
-_MC_WIN_Y = 546
-
-
-def _raise_minecraft_window_once() -> Optional[str]:
-    """Find and raise every Minecraft window to the center monitor via Xlib."""
-    try:
-        import subprocess
-        display_env = os.environ.get("DISPLAY", ":1")
-        from Xlib import display as _xdisp, X
-        from Xlib.protocol import event as _xevent
-
-        result = subprocess.run(
-            ["xwininfo", "-root", "-children", "-display", display_env],
-            capture_output=True, text=True, timeout=5,
-        )
-        win_ids = [
-            line.strip().split()[0]
-            for line in result.stdout.splitlines()
-            if "Minecraft" in line and "0x" in line
-        ]
-        if not win_ids:
-            return None
-
-        d = _xdisp.Display(display_env)
-        root = d.screen().root
-        NET_ACTIVE = d.intern_atom("_NET_ACTIVE_WINDOW")
-        for win_id in win_ids:
-            win = d.create_resource_object("window", int(win_id, 16))
-            win.map()
-            d.sync()
-            # Move only — do NOT resize. Resizing confuses MineStudio's frame capture.
-            win.configure(x=_MC_WIN_X, y=_MC_WIN_Y)
-            d.sync()
-            ev = _xevent.ClientMessage(
-                window=win,
-                client_type=NET_ACTIVE,
-                data=(32, [2, X.CurrentTime, 0, 0, 0]),
-            )
-            root.send_event(ev, event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask)
-        d.sync()
-        return win_ids[-1]
-    except Exception as exc:
-        logger.debug("_raise_minecraft_window_once: %s", exc)
-        return None
-
-
-def _show_minecraft_window(interval: int = 15) -> None:
-    """Raise the Minecraft window now and keep re-raising it every *interval* seconds."""
-    global _WINDOW_KEEPER_RUNNING
-
-    win_id = None
-    for _ in range(20):          # poll up to 10 s for the window to appear
-        win_id = _raise_minecraft_window_once()
-        if win_id:
-            break
-        time.sleep(0.5)
-
-    if win_id:
-        logger.info("Minecraft window raised to 0,0 (1280x720)")
-    else:
-        logger.warning("Minecraft window not found — may need to view DISPLAY=%s manually",
-                       os.environ.get("DISPLAY", ":1"))
-
-    if _WINDOW_KEEPER_RUNNING:
-        return
-    _WINDOW_KEEPER_RUNNING = True
-
-    def _keeper():
-        while True:
-            time.sleep(interval)
-            try:
-                _raise_minecraft_window_once()
-            except Exception:
-                pass
-
-    t = threading.Thread(target=_keeper, daemon=True, name="mc-window-keeper")
-    t.start()
-    logger.info("Window keeper started (re-raises every %ds)", interval)
-
 
 def _make_env(seed: int) -> Any:
     from minestudio.simulator import MinecraftSim
     from minestudio.simulator.entry import check_engine
     check_engine(skip_confirmation=True)
     env = MinecraftSim(
-        action_type="agent",
+        action_type="env",
         obs_size=(224, 224),
         preferred_spawn_biome="forest",
         seed=seed,
+        # No callbacks — PlayCallback GUI is driven manually in the game loop
+        # so it cannot interfere with env.reset() internals.
     )
     return env
 
@@ -438,29 +309,40 @@ def _exec_cmds(env: Any, obs: Dict, info: Dict, cmds: List[str]) -> Tuple[Dict, 
     return obs, info
 
 
-def _setup_skill(env: Any, obs: Dict, info: Dict, skill: str) -> Tuple[Dict, Dict]:
-    """Apply common + skill-specific setup commands."""
-    cmds = list(_COMMON_SETUP) + _SKILL_SETUP.get(skill, [])
-    return _exec_cmds(env, obs, info, cmds)
+def _inv_has_diamond(info: Dict) -> bool:
+    """Return True if a diamond appears in the agent's inventory."""
+    diamond_names = {"diamond", "minecraft:diamond"}
+    inv = info.get("inventory", {})
+    if isinstance(inv, dict):
+        names = inv.get("name", [])
+        qtys  = inv.get("quantity", [])
+        if hasattr(names, "__len__") and len(names) > 0:
+            for n, q in zip(names, qtys):
+                if str(n).strip().lower().rstrip("\x00") in diamond_names and int(q) > 0:
+                    return True
+        for v in inv.values():
+            if isinstance(v, dict):
+                if str(v.get("type", "")).lower() in diamond_names and int(v.get("quantity", 0)) > 0:
+                    return True
+    pickup = info.get("pickup", {})
+    return any(pickup.get(name, 0) > 0 for name in diamond_names)
 
 # ---------------------------------------------------------------------------
 # Save helpers
 # ---------------------------------------------------------------------------
 
 def _save_segment(
-    skill: str,
-    seg_idx: int,
+    seed: int,
     frames: List[np.ndarray],
     actions: List[Dict],
     annotations: List[Dict],
     out_dir: str,
     fps: int = 20,
 ) -> str:
-    skill_dir = os.path.join(out_dir, skill)
-    os.makedirs(skill_dir, exist_ok=True)
-    tag = f"demo_{seg_idx:03d}"
-    mp4 = os.path.join(skill_dir, f"{tag}.mp4")
-    npz = os.path.join(skill_dir, f"{tag}_bc.npz")
+    seed_dir = os.path.join(out_dir, f"seed_{seed:03d}")
+    os.makedirs(seed_dir, exist_ok=True)
+    mp4 = os.path.join(seed_dir, "playthrough.mp4")
+    npz = os.path.join(seed_dir, "playthrough_bc.npz")
 
     h, w = frames[0].shape[:2]
     writer = cv2.VideoWriter(mp4, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
@@ -483,15 +365,13 @@ def _save_segment(
                         bool_keys=np.array(BOOL_KEYS), camera=camera_arr)
 
     if annotations:
-        annot_path = os.path.join(skill_dir, f"{tag}_annotations.json")
+        annot_path = os.path.join(seed_dir, "playthrough_annotations.json")
         with open(annot_path, "w") as fh:
             json.dump({
-                "skill": skill,
-                "segment": seg_idx,
+                "seed": seed,
                 "total_frames": len(frames),
                 "fps": fps,
                 "labeled_segments": annotations,
-                # Convenience: frames not covered by any segment are "unlabeled"
                 "note": (
                     "Each entry has start_frame, end_frame (inclusive), and label (str). "
                     "Use these to slice obs/bc arrays for targeted fine-tuning."
@@ -505,14 +385,6 @@ def _save_segment(
 # ---------------------------------------------------------------------------
 # Main session loop
 # ---------------------------------------------------------------------------
-
-def _next_seg_idx(out_dir: str, skill: str) -> int:
-    skill_dir = os.path.join(out_dir, skill)
-    if not os.path.isdir(skill_dir):
-        return 0
-    existing = [f for f in os.listdir(skill_dir) if f.endswith(".mp4")]
-    return len(existing)
-
 
 def _load_manifest(out_dir: str) -> List[Dict]:
     path = os.path.join(out_dir, "manifest.json")
@@ -532,183 +404,196 @@ def _save_manifest(out_dir: str, entries: List[Dict]) -> None:
 def _record_seed(
     seed: int,
     seed_label: str,
-    start_skill_idx: int,
     args: argparse.Namespace,
     manifest: List[Dict],
+    play_cb: _RecordingPlayCallback,
 ) -> bool:
-    """Record all skills for one seed in a single continuous world session.
+    """Record one full free-play session for a seed.
 
-    The world is loaded ONCE per seed.  Between skills only /give commands
-    run — no world reset — so the player stays in the same terrain throughout
-    the full wood→diamond playthrough.  The world only reloads when moving to
-    the next seed.
+    The world loads once. Recording starts immediately. The session ends when:
+      - A diamond appears in the inventory  → auto-advance to next seed
+      - The user presses F12               → quit
 
     Returns False if the user pressed F12 (quit).
     """
-    global _recording, _advance, _quit
-
     logger.info("\n%s\n%s  seed=%d\n%s", "="*70, seed_label, seed, "="*70)
+    logger.info(
+        "\n"
+        "  Recording to → %s/seed_%03d/\n"
+        "  F5  = annotate (describe what you're about to do)\n"
+        "  F12 = QUIT session\n"
+        "  Recording will stop automatically when you collect a diamond.\n",
+        args.out_dir, seed,
+    )
+
     env = _make_env(seed)
-    obs, info = env.reset()
 
-    # Apply common setup once for this world (hunger off, time lock, effects)
-    obs, info = _exec_cmds(env, obs, info, list(_COMMON_SETUP))
-    _show_minecraft_window()
+    # Show "Resetting..." in the PlayCallback window while waiting for Malmo.
+    play_cb.show_resetting()
 
-    try:
-        noop_action = env.noop_action()
-    except AttributeError:
-        noop_action = {}
+    # Retry env.reset() with a 25-second gap between attempts.
+    # Why 25s: after Malmo restarts internally, the JVM says "process ready"
+    # after ~15s but the Malmo socket needs ~10s more to start accepting
+    # connections.  A 5s delay (previous value) was consistently too short;
+    # 25s gives the full ~25s window after "process ready".
+    for _attempt in range(5):
+        try:
+            obs, info = env.reset()
+            break
+        except (ConnectionRefusedError, ConnectionResetError, OSError) as _exc:
+            if _attempt == 4:
+                raise
+            logger.warning("env.reset() failed (%s), retry %d/5 in 25 s…", _exc, _attempt + 1)
+            play_cb.show_resetting()
+            time.sleep(25)
+
+    # Apply common setup: hunger off, time lock to day, survival effects, torches
+    obs, info = _exec_cmds(env, obs, info, list(_COMMON_SETUP) + [
+        "/give @p minecraft:torch 64",
+    ])
+
+    # Position window and push the first frame to the GUI
+    play_cb.position_window(x=1080, y=546, w=1280, h=720)
+    play_cb.update_display(info)
+
+    # Reset per-seed flags
+    play_cb.f5_pressed = False
+    play_cb.quit_pressed = False
+
+    # Annotation state (local to this seed)
+    annotation_segments: List[Dict] = []
+    current_label: Optional[str] = None
+    label_start_frame: int = 0
+    current_frame: int = 0
 
     tick = 1.0 / args.fps
+    frames: List[np.ndarray] = []
+    actions: List[Dict] = []
+    diamond_found = False
 
-    for skill_idx in range(start_skill_idx, len(SKILL_SEQUENCE)):
-        if _quit:
-            break
+    try:
+        while not play_cb.quit_pressed and not diamond_found:
+            # --- Handle F5 annotation prompt ---
+            if play_cb.f5_pressed:
+                play_cb.f5_pressed = False
+                play_cb.release_mouse()
 
-        skill = SKILL_SEQUENCE[skill_idx]
-        seg_idx = _next_seg_idx(args.out_dir, skill)
+                # Close the previous labeled segment
+                if current_label is not None:
+                    annotation_segments.append({
+                        "start_frame": label_start_frame,
+                        "end_frame":   current_frame,
+                        "label":       current_label,
+                    })
+                    logger.info("[annot] Closed: '%s' frames %d–%d",
+                                current_label, label_start_frame, current_frame)
+                    current_label = None
 
-        # Apply only skill-specific /give commands — NO env.reset() between skills
-        skill_cmds = _SKILL_SETUP.get(skill, [])
-        if skill_cmds:
-            obs, info = _exec_cmds(env, obs, info, skill_cmds)
-
-        # Reset per-skill recording state
-        _recording = False
-        _advance = False
-        globals()["_waiting_for_label"] = False
-        globals()["_current_label"] = None
-        globals()["_label_start_frame"] = 0
-        globals()["_current_frame"] = 0
-        with _annot_lock:
-            _annotation_segments.clear()
-
-        logger.info(
-            "\n%s\n%s  Skill %d/%d: %s\n  %s\n%s",
-            "="*70, seed_label,
-            skill_idx + 1, len(SKILL_SEQUENCE), skill.upper(),
-            _SKILL_DESCRIPTIONS.get(skill, ""),
-            "="*70,
-        )
-        logger.info(
-            "\n"
-            "  Will save → %s/%s/demo_%03d.mp4\n"
-            "  F5  = bookmark / annotate current frame\n"
-            "  F10 = START recording\n"
-            "  F11 = STOP + SAVE → next skill\n"
-            "  F12 = QUIT session\n",
-            args.out_dir, skill, seg_idx,
-        )
-
-        frames: List[np.ndarray] = []
-        actions: List[Dict] = []
-
-        while not _quit and not _advance:
-            # --- Handle label-prompt triggered by F5 ---
-            if _waiting_for_label:
-                globals()["_in_label_input"] = True
-                # Close the current segment if one was active
-                cur_label = globals()["_current_label"]
-                if cur_label is not None:
-                    with _annot_lock:
-                        _annotation_segments.append({
-                            "start_frame": globals()["_label_start_frame"],
-                            "end_frame":   globals()["_current_frame"],
-                            "label":       cur_label,
-                        })
-                    logger.info("[annot] Segment closed: '%s' frames %d–%d",
-                                cur_label,
-                                globals()["_label_start_frame"],
-                                globals()["_current_frame"])
-                    globals()["_current_label"] = None
-
-                # Prompt in terminal (blocks game loop — that's fine)
                 print("\n" + "─"*60)
-                print(f"  Annotating skill: {skill.upper()}")
+                print(f"  Annotate — seed {seed}")
                 print("  Describe what you are about to do (or press Enter to skip):")
-                print("  Examples: 'walking to coal vein', 'mining coal with pickaxe',")
-                print("            'navigating down to y=11', 'placing torch for light'")
+                print("  Examples: 'chopping oak tree', 'crafting wooden pickaxe',")
+                print("            'mining coal', 'digging to diamond level', 'placing torch'")
                 label = input("  >>> ").strip()
 
                 if label:
-                    globals()["_current_label"] = label
-                    globals()["_label_start_frame"] = globals()["_current_frame"]
-                    logger.info("[annot] Segment started: '%s' at frame %d", label, globals()["_current_frame"])
+                    current_label = label
+                    label_start_frame = current_frame
+                    logger.info("[annot] Started: '%s' at frame %d", label, current_frame)
                 else:
-                    logger.info("[annot] No label entered — continuing unlabeled")
+                    logger.info("[annot] No label — continuing unlabeled")
 
-                globals()["_waiting_for_label"] = False
-                globals()["_in_label_input"] = False
+                play_cb.capture_mouse()
                 print("─"*60 + "\n")
 
             t0 = time.perf_counter()
 
-            act = _build_action(noop_action)
+            # Read human input from PlayCallback GUI (dispatches events too)
+            action = play_cb.get_action()
+
             try:
-                obs, _r, terminated, truncated, info = env.step(act)
+                obs, _r, terminated, truncated, info = env.step(action)
             except Exception as exc:
-                logger.warning("env.step error: %s", exc)
-                terminated = True
+                logger.warning("env.step error: %s — skipping frame", exc)
+                elapsed = time.perf_counter() - t0
+                wait = tick - elapsed
+                if wait > 0:
+                    time.sleep(wait)
+                continue
 
-            if _recording and "image" in obs:
+            if "image" in obs:
                 frames.append(obs["image"].copy())
-                actions.append(act)
-                globals()["_current_frame"] = len(frames) - 1
+                actions.append(action)
+                play_cb.update_display(info)
+                current_frame = len(frames) - 1
 
-            # If the episode ends unexpectedly (death etc.), reset and re-apply setup
+            # Check for diamond — advance seed automatically
+            if _inv_has_diamond(info):
+                diamond_found = True
+                logger.info("[seed=%d] Diamond found at frame %d! Advancing to next seed.",
+                            seed, current_frame)
+                break
+
+            # Respawn on death without resetting the world
             if terminated or truncated:
-                logger.warning("[%s] Unexpected episode end — respawning in same world.", skill)
-                obs, info = env.reset()
-                obs, info = _exec_cmds(env, obs, info, list(_COMMON_SETUP))
-                if skill_cmds:
-                    obs, info = _exec_cmds(env, obs, info, skill_cmds)
+                logger.warning("[seed=%d] Episode ended — respawning.", seed)
+                play_cb.show_resetting()
+                for _ra in range(3):
+                    try:
+                        obs, info = env.reset()
+                        break
+                    except (ConnectionRefusedError, ConnectionResetError, OSError) as _exc:
+                        if _ra == 2:
+                            break
+                        logger.warning("respawn reset failed (%s), retry %d/3…", _exc, _ra + 1)
+                        play_cb.show_resetting()
+                        time.sleep(25)
+                obs, info = _exec_cmds(env, obs, info, list(_COMMON_SETUP) + [
+                    "/give @p minecraft:torch 64",
+                ])
+                play_cb.update_display(info)
 
             elapsed = time.perf_counter() - t0
             wait = tick - elapsed
             if wait > 0:
                 time.sleep(wait)
 
-        # Close the last open annotation segment on F11/F12
-        if globals()["_current_label"] is not None:
-            with _annot_lock:
-                _annotation_segments.append({
-                    "start_frame": globals()["_label_start_frame"],
-                    "end_frame":   globals()["_current_frame"],
-                    "label":       globals()["_current_label"],
-                })
-            globals()["_current_label"] = None
+    finally:
+        # Close the last open annotation segment
+        if current_label is not None:
+            annotation_segments.append({
+                "start_frame": label_start_frame,
+                "end_frame":   current_frame,
+                "label":       current_label,
+            })
 
         if frames:
-            with _annot_lock:
-                annots = list(_annotation_segments)
-            mp4 = _save_segment(skill, seg_idx, frames, actions, annots, args.out_dir, args.fps)
+            mp4 = _save_segment(seed, frames, actions, annotation_segments, args.out_dir, args.fps)
             entry = {
-                "seed": seed, "skill": skill, "segment": seg_idx,
-                "frames": len(frames), "annotations": len(annots),
+                "seed": seed,
+                "frames": len(frames),
+                "diamond_found": diamond_found,
+                "annotations": len(annotation_segments),
                 "mp4": mp4,
             }
             manifest.append(entry)
             _save_manifest(args.out_dir, manifest)
-            logger.info("[%s] seed=%d demo_%03d saved (%d frames, %d annotations).",
-                        skill, seed, seg_idx, len(frames), len(annots))
+            logger.info("seed=%d saved: %d frames, diamond=%s, %d annotations.",
+                        seed, len(frames), diamond_found, len(annotation_segments))
         else:
-            logger.info("[%s] No frames recorded — skipping save.", skill)
+            logger.info("seed=%d: no frames recorded.", seed)
 
-    try:
-        env.close()
-    except Exception:
-        pass
+        try:
+            env.close()
+        except Exception:
+            pass
 
-    return not _quit
+    return not play_cb.quit_pressed
 
 
 def record(args: argparse.Namespace) -> None:
-    global _quit
-
     seeds: List[int] = args.seeds
     start_seed_val = args.start_seed if args.start_seed is not None else seeds[0]
-    start_skill_idx = SKILL_SEQUENCE.index(args.start_skill) if args.start_skill in SKILL_SEQUENCE else 0
 
     # Find where to resume in the seed list
     if start_seed_val in seeds:
@@ -718,40 +603,30 @@ def record(args: argparse.Namespace) -> None:
 
     manifest = _load_manifest(args.out_dir)
 
-    logger.info(
-        "Recording %d playthroughs: seeds %s",
-        len(seeds), seeds,
-    )
-    logger.info("Resuming from seed=%d, skill=%s", start_seed_val, args.start_skill)
+    logger.info("Recording %d playthroughs: seeds %s", len(seeds), seeds)
+    logger.info("Resuming from seed=%d", start_seed_val)
 
-    kb = _kb.Listener(on_press=_on_key_press, on_release=_on_key_release)
-    ms = _ms.Listener(on_move=_on_mouse_move, on_click=_on_mouse_click)
-    kb.start(); ms.start()
+    # Create one PlayCallback for the whole session — its pyglet window persists
+    # across seeds and provides exclusive mouse + keyboard capture.
+    play_cb = _RecordingPlayCallback()
 
     for s_idx in range(seed_start, len(seeds)):
-        if _quit:
+        if play_cb.quit_pressed:
             break
 
         seed = seeds[s_idx]
         seed_label = f"[Playthrough {s_idx + 1}/{len(seeds)}]"
-        # start_skill only applies to the first (possibly resumed) seed
-        skill_start = start_skill_idx if s_idx == seed_start else 0
 
-        ok = _record_seed(seed, seed_label, skill_start, args, manifest)
+        ok = _record_seed(seed, seed_label, args, manifest, play_cb)
         if not ok:
             break
 
         logger.info("\n%s\nPlaythrough %d/%d complete (seed=%d).\n%s",
                     "="*70, s_idx + 1, len(seeds), seed, "="*70)
 
-    kb.stop(); ms.stop()
-
-    demos_per_skill = {
-        skill: len([e for e in manifest if e["skill"] == skill])
-        for skill in SKILL_SEQUENCE
-    }
+    diamond_seeds = [e["seed"] for e in manifest if e.get("diamond_found")]
     logger.info("\nSession complete.")
-    logger.info("Demos collected per skill: %s", demos_per_skill)
+    logger.info("Seeds with diamond: %s", diamond_seeds)
     logger.info("Manifest: %s/manifest.json (%d entries)", args.out_dir, len(manifest))
 
 # ---------------------------------------------------------------------------
@@ -764,14 +639,12 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    ap.add_argument("--out_dir",     default="data/playthrough_demos")
-    ap.add_argument("--seeds",       type=int, nargs="+", default=list(range(20)),
+    ap.add_argument("--out_dir",    default="data/playthrough_demos")
+    ap.add_argument("--seeds",      type=int, nargs="+", default=list(range(20)),
                     help="Seed values to record, in order (default: 0–19)")
-    ap.add_argument("--fps",         type=int, default=20)
-    ap.add_argument("--start_seed",  type=int, default=None,
+    ap.add_argument("--fps",        type=int, default=20)
+    ap.add_argument("--start_seed", type=int, default=None,
                     help="Resume from this seed (must be in --seeds list)")
-    ap.add_argument("--start_skill", default="wood", choices=SKILL_SEQUENCE,
-                    help="Resume from this skill within --start_seed's playthrough")
     args = ap.parse_args()
 
     print("record_playthrough_demos.py")
@@ -779,15 +652,12 @@ def main() -> None:
     print(f"  {'seeds':12s}: {args.seeds}")
     print(f"  {'fps':12s}: {args.fps}")
     print(f"  {'start_seed':12s}: {args.start_seed}")
-    print(f"  {'start_skill':12s}: {args.start_skill}")
-    print()
-    print("Skill sequence:", " → ".join(SKILL_SEQUENCE))
     print()
     print("Controls:")
-    print("  F5  = annotate / bookmark current frame")
-    print("  F10 = start recording")
-    print("  F11 = stop + save → next skill")
+    print("  F5  = annotate (describe what you're about to do)")
     print("  F12 = quit session")
+    print()
+    print("Seed advances automatically when you collect a diamond.")
     print()
 
     record(args)

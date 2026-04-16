@@ -146,11 +146,10 @@ Fix: unwrap one level with `getattr(env, "_env", env)` before looking up `.env`.
   - stone → wooden_pickaxe, coal/ironore → stone_pickaxe, diamond → iron_pickaxe
   - Fixes bare-hands ironore mining (zero drops) observed in it7: agent had stone_pickaxe in inventory but not equipped
 - Added `scripts/record_playthrough_demos.py`: full tech-tree sequential demo recorder
-  - Covers all 10 skills: wood → woodpickaxe → stone → coal → furnace → stonepickaxe → ironore → iron → ironpickaxe → diamond
-  - Per-skill setup: gives prerequisite items + equips correct pickaxe in slot 1 via `/item replace`
-  - `--start_skill` flag to resume from interrupted session
-  - Saves MP4 + BC `.npz` per segment; auto-increments index if demos already exist
-- Retained from it7: water_breathing, fire_resistance, torch give, video recording, `/give` wrapper fix
+  - Redesigned as diamond-gated free-play (one world per seed, records continuously until diamond in inventory)
+  - F5 to annotate segments, F12 to quit, diamond auto-advances to next seed
+  - Saves MP4 + BC `.npz` + annotation JSON per seed
+- Retained from it7: water_breathing, fire_resistance, torch give, `/give` wrapper fix
 
 **Root cause identified (coal never found):**
 User observed during it7 run: agent walked past multiple coal blocks in a cavern without attacking them.
@@ -166,6 +165,33 @@ demonstrates approach + initiation for each skill.
 
 ---
 
+## recorder — PlayCallback integration + Malmo timing fixes
+
+**Changes to `scripts/record_playthrough_demos.py`:**
+
+### PlayCallback integration (exclusive mouse capture)
+- Replaced pynput global listener with MineStudio's `PlayCallback` for all input capture
+  - PlayCallback creates a dedicated pyglet window with exclusive mouse lock
+  - 'C' key captures/releases mouse; Ctrl+C or F12 quits
+  - No more desktop bleed-through: mouse/keyboard only affect the game window
+- `_RecordingPlayCallback` wraps PlayCallback as a **standalone GUI controller** (NOT a MineStudio callback)
+  - Key insight: registering as a callback interfered with `env.reset()` internals
+  - Instead: `get_action()` dispatches pyglet events + returns human action directly; `update_display()` pushes frames
+  - F5/F12 detected via `_capture_all_keys()` inside `get_action()` (called once per game tick)
+- Patched `minestudio/simulator/utils/gui.py` line 340: `layout.update(x, y)` → `layout.x = ...; layout.y = ...`
+  - pyglet 2.x removed `TextLayout.update()` — replaced with direct attribute assignment
+
+### Malmo connection timing fix
+- `env.reset()` retry delay: **5s → 25s**
+  - Root cause: after a Malmo restart, the JVM reaches "process ready" after ~15s but the Malmo socket needs ~10s more before accepting connections. 5s retries were consistently firing into that 10s window, each triggering another Minecraft restart. 25s clears the full window.
+- `play_cb.show_resetting()` shown before each `env.reset()` attempt (user feedback)
+- `play_cb.update_display(info)` called after reset + setup commands to show the initial frame
+
+### Architecture: `action_type="env"` (unchanged from it8)
+- Produces individual-key action dict, compatible with PlayCallback's `_get_human_action()` output
+
+---
+
 ## Known Issues / Open Problems
 
 | Problem | Status | Evidence |
@@ -177,6 +203,9 @@ demonstrates approach + initiation for each skill.
 | _VideoRecordingEnv breaks /give fallback | ✅ Fixed (it7.1) | `_give_item` now unwraps `_env` before seeking `execute_cmd` |
 | Iron ore mined with bare hands (zero drops) | ✅ Fixed (it8) | `_equip_pickaxe()` puts correct pickaxe in hotbar.0 before each underground gather |
 | Diamond never found | ❌ Unsolved | Requires ironore → iron → ironpickaxe first |
+| recorder: env.reset() loops on ConnectionRefusedError | ✅ Fixed (recorder) | Retry delay 5s→25s; PlayCallback decoupled from MinecraftSim callback chain |
+| recorder: pynput bleeds input to desktop | ✅ Fixed (recorder) | Replaced with PlayCallback pyglet window (exclusive mouse) |
+| gui.py TextLayout.update() crash (pyglet 2.x) | ✅ Fixed (site-pkg patch) | `layout.update(x,y)` → `layout.x=; layout.y=` |
 
 ---
 
