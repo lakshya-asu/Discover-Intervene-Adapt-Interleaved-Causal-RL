@@ -135,6 +135,11 @@ def _obs_to_vars(obs: Any) -> np.ndarray:
 
     Binary threshold: variable = 1.0 iff count >= 1.
     (The 2D symbolic env also uses binary presence, so transfer is clean.)
+
+    Handles three obs shapes:
+    - Raw MineDojo dict  (obs["inventory"] is a structured array/dict with names+quantities)
+    - Wrapped obs dict   (obs["inventory"] is already a (9,) float32 EVGS binary vector)
+    - Raw inventory directly passed as numpy array
     """
     if isinstance(obs, dict):
         inv = obs.get("inventory", obs.get("obs", None))
@@ -143,6 +148,16 @@ def _obs_to_vars(obs: Any) -> np.ndarray:
 
     if inv is None:
         return np.zeros(len(VAR_NAMES), dtype=float)
+
+    # Fast path: already a pre-processed EVGS binary/float vector (9,)
+    # This happens when obs comes from MinedojoObsWrapper._convert(), which stores
+    # evgs.extract(raw_obs) directly in obs["inventory"].
+    # Note: all numpy dtypes have a .names attribute; None means non-structured.
+    if (isinstance(inv, np.ndarray)
+            and inv.ndim == 1
+            and inv.shape[0] == len(VAR_NAMES)
+            and inv.dtype.names is None):
+        return (inv >= 0.5).astype(float)
 
     counts = _extract_inventory_counts(inv)
     return (counts >= 1.0).astype(float)

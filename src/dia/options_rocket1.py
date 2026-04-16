@@ -53,18 +53,16 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Interaction type IDs used by ROCKET-1's segmentation input
-# 0=Hunt, 2=Mine, 3=Use/Interact, 4=Craft, 5=Switch, 6=Approach
+# Canonical mapping from MineStudio tutorials/inference/evaluate_rocket/utils.py:
+#   SEGMENT_MAPPING = {"Hunt":0, "Use":3, "Mine":2, "Interact":3,
+#                       "Craft":4, "Switch":5, "Approach":6, "None":-1}
 # ---------------------------------------------------------------------------
-_OBJ_ID_MINE = 2
+_OBJ_ID_MINE     = 2   # "Mine"     — break blocks
+_OBJ_ID_APPROACH = 6   # "Approach" — navigate toward target
 
-# Skills that require mining (obj_id=2); use Approach (6) for navigation
-_SKILL_OBJ_ID: dict[str, int] = {
-    "wood":    _OBJ_ID_MINE,
-    "stone":   _OBJ_ID_MINE,
-    "coal":    _OBJ_ID_MINE,
-    "ironore": _OBJ_ID_MINE,
-    "diamond": _OBJ_ID_MINE,
-}
+# When target IS visible (SAM-2 tracking): Mine (2) + SAM-2 mask
+# When target NOT visible (searching):     Approach (6) + zero mask
+# This matches how the official MineStudio demo uses ROCKET-1.
 
 # Module-level lazy singleton — loaded once, reused across option instances
 _ROCKET1_POLICY: Optional[Any] = None
@@ -229,7 +227,9 @@ class ROCKET1GatherOption:
         self.subgoal = subgoal
         self.cfg = cfg
         self.skill_name = skill_name
-        self.obj_id = _SKILL_OBJ_ID.get(skill_name, _OBJ_ID_MINE)
+        # SAM-2 tracker — built lazily on first run(), None if unavailable
+        self._sam2: Optional[Any] = None
+        self._sam2_tried: bool = False
 
     # ------------------------------------------------------------------
     # Public interface
@@ -265,6 +265,26 @@ class ROCKET1GatherOption:
 
         device = next(policy.parameters()).device
         obs = env.get_obs()
+        # Keep the raw MineDojo obs around for voxel-based mask generation.
+        # MinedojoObsWrapper stores it as _last_obs; some wrappers use _last_raw.
+        raw_obs = getattr(env, '_last_obs', None) or getattr(env, '_last_raw', None)
+
+        # ── Lazy-build SAM-2 tracker (once per option instance) ───────────
+        if not self._sam2_tried:
+            self._sam2_tried = True
+            try:
+                from dia.sam2_tracker import SAM2Tracker
+                _dev = "cuda" if str(device) != "cpu" else "cpu"
+                self._sam2 = SAM2Tracker.build(device=_dev)
+                if self._sam2 is not None:
+                    logger.info("SAM-2 tracker ready for skill '%s'", self.skill_name)
+                else:
+                    logger.info("SAM-2 unavailable — using voxel/full-frame mask")
+            except Exception as exc:
+                logger.warning("SAM-2 build failed (%s) — using voxel/full-frame mask", exc)
+        if self._sam2 is not None:
+            self._sam2.reset()  # fresh tracking session for each run() call
+
         # Use None for first call — initial_state() returns squeezed tensors that
         # cause a dim mismatch when passed back through get_action("*")'s single
         # unsqueeze. Model creates correct internal state when state_in=None.
@@ -273,9 +293,33 @@ class ROCKET1GatherOption:
 
         for _ in range(self.cfg.max_steps):
             rgb = self._get_rgb_224(obs)
+            H, W = rgb.shape[:2]
 
-            # Build segmentation mask: voxel-derived if available, else full-frame
-            obj_mask = self._make_mask(obs, rgb.shape[:2])
+            # ── Two-phase interaction type selection ──────────────────────────
+            # Phase 1 (searching): obj_id=Approach(6), mask=zeros
+            #   → ROCKET-1 navigates toward the target area
+            # Phase 2 (target visible): obj_id=Mine(2), mask=SAM-2
+            #   → ROCKET-1 aims at and breaks the specific block
+            # This matches the official MineStudio demo (session.segment_type="Approach"
+            # with zeros mask initially; switches to Mine when SAM-2 is initialised).
+            # Get the best seed point for SAM-2.
+            # Priority: voxel projection (precise) → image center (forest fallback).
+            # ROCKET-1 was trained with always-present SAM-2 masks (from Molmo VLM
+            # or human click). Without a seed we lose the spatial grounding entirely.
+            # In a forest biome the image center is almost always a tree log or leaf,
+            # making center a reasonable fallback when voxels don't reach the tree.
+            seed_xy = self._voxel_seed_point(raw_obs, H, W)
+            if seed_xy is None:
+                seed_xy = (W // 2, H // 2)  # center fallback (works well in forests)
+
+            if self._sam2 is not None:
+                obj_mask = self._sam2.update(rgb, seed_xy=seed_xy)
+            else:
+                obj_mask = self._make_mask(obs, (H, W), raw_obs=raw_obs)
+
+            # When SAM-2 has a valid mask → Mine (2); when mask collapsed/zeros → Mine
+            # still (ROCKET-1 needs Mine mode to chop blocks even if mask is imperfect).
+            active_obj_id = _OBJ_ID_MINE
 
             rocket_input = {
                 "image": rgb,  # (H, W, 3) uint8
@@ -284,7 +328,7 @@ class ROCKET1GatherOption:
                     # produces (1, 1) — 2D — making interaction() output (1, 1, hiddim)
                     # 3D.  A 1-D [val] would become (1,1,1) → (1,1,1,hiddim) 4D,
                     # which then breaks the KV-cache cat in xf.py update_state.
-                    "obj_id":   torch.tensor(self.obj_id, dtype=torch.int64).to(device),
+                    "obj_id":   torch.tensor(active_obj_id, dtype=torch.int64).to(device),
                     "obj_mask": torch.tensor(obj_mask, dtype=torch.uint8).to(device),
                 },
             }
@@ -301,15 +345,24 @@ class ROCKET1GatherOption:
 
             # Step environment
             next_raw, _rew, done, _info = env.env.step(minedojo_action)
+            # Update cached raw obs on the wrapper (both attribute names used across wrappers)
             env._last_raw = next_raw
+            if hasattr(env, '_last_obs'):
+                env._last_obs = next_raw
             next_obs = env._convert(next_raw)
+            raw_obs = next_raw  # update for next iteration's mask
 
             trajectory.append((obs, action_dict, next_obs, done))
             obs = next_obs
             steps = len(trajectory)
 
-            # Success check via EVGS inventory
-            if evgs.extract(obs)[self.subgoal.var_index] > 0.5:
+            # Success check: obs["inventory"] is the EVGS binary vector (9,) float32
+            # stored by MinedojoObsWrapper._convert().  Direct indexing is faster
+            # and avoids re-extracting from the raw MineDojo inventory format.
+            inv_vec = obs.get("inventory") if isinstance(obs, dict) else None
+            got_it = (inv_vec is not None
+                      and inv_vec[self.subgoal.var_index] > 0.5)
+            if got_it:
                 return {
                     "success": True,
                     "steps": steps,
@@ -336,36 +389,285 @@ class ROCKET1GatherOption:
         }
 
     # ------------------------------------------------------------------
+    # Voxel seed point for SAM-2 initialisation
+    # ------------------------------------------------------------------
+
+    def _voxel_seed_point(
+        self, raw_obs: Any, H: int, W: int
+    ) -> Optional[tuple]:
+        """
+        Return (cx, cy) image pixel coords of the most visible target voxel,
+        or None if no target voxel is in front of the agent.
+
+        Uses the same perspective projection as _voxel_to_mask but returns
+        only the single best point (highest fwd_dist = most likely visible).
+        """
+        import math
+        if raw_obs is None or not isinstance(raw_obs, dict):
+            return None
+        try:
+            from dia.evgs_minedojo import SKILL_TARGETS
+        except ImportError:
+            return None
+
+        targets = {t.lower() for t in SKILL_TARGETS.get(self.skill_name, [])}
+        if not targets:
+            return None
+
+        voxel_obs = raw_obs.get("voxels", None)
+        if voxel_obs is None:
+            return None
+
+        try:
+            if isinstance(voxel_obs, dict):
+                block_names = voxel_obs.get("block_name", None)
+            elif getattr(voxel_obs, "dtype", None) and getattr(voxel_obs.dtype, "names", None):
+                block_names = (voxel_obs["block_name"]
+                               if "block_name" in voxel_obs.dtype.names else None)
+            else:
+                block_names = None
+            if block_names is None:
+                return None
+
+            bn_arr = np.asarray(block_names)
+            if bn_arr.ndim < 3:
+                return None
+
+            X, Y, Z = bn_arr.shape
+            cx_g, cy_g, cz_g = X // 2, Y // 2, Z // 2
+
+            loc = raw_obs.get("location_stats", {}) or {}
+            def _flt(d, k, dv=0.0):
+                v = d.get(k, dv)
+                if v is None: return dv
+                try: return float(np.asarray(v).ravel()[0])
+                except: return dv
+
+            ya = math.radians(_flt(loc, "yaw",   0.0))
+            pa = math.radians(_flt(loc, "pitch", 0.0))
+            fw = np.array([-math.sin(ya)*math.cos(pa), -math.sin(pa), math.cos(ya)*math.cos(pa)])
+            world_up = np.array([0.0, 1.0, 0.0])
+            rt = np.cross(world_up, fw)
+            rt_norm = np.linalg.norm(rt)
+            rt = rt / rt_norm if rt_norm > 1e-6 else np.array([1.0, 0.0, 0.0])
+            up = np.cross(fw, rt)
+
+            best_fwd, best_xy = -1.0, None
+            for xi in range(X):
+                for yi in range(Y):
+                    for zi in range(Z):
+                        name = str(bn_arr[xi, yi, zi]).lower().strip().rstrip("\x00")
+                        if name not in targets:
+                            continue
+                        world_off = np.array([float(xi-cx_g), float(yi-cy_g), float(zi-cz_g)])
+                        fwd_dist = float(np.dot(fw, world_off))
+                        if fwd_dist <= 0.1:
+                            continue
+                        if fwd_dist > best_fwd:
+                            best_fwd = fwd_dist
+                            x_cam = float(np.dot(rt, world_off))
+                            y_cam = float(np.dot(up, world_off))
+                            FOCAL = 1.0
+                            u = (x_cam / (fwd_dist * FOCAL)) * 0.5 + 0.5
+                            v = (-y_cam / (fwd_dist * FOCAL)) * 0.5 + 0.5
+                            img_x = int(np.clip(u * W, 0, W - 1))
+                            img_y = int(np.clip(v * H, 0, H - 1))
+                            best_xy = (img_x, img_y)
+
+            return best_xy  # None if no in-front target
+
+        except Exception as exc:
+            logger.debug("_voxel_seed_point error (%s)", exc)
+            return None
+
+    # ------------------------------------------------------------------
     # Mask construction
     # ------------------------------------------------------------------
 
-    def _make_mask(self, obs: dict, shape: tuple) -> np.ndarray:
+    def _make_mask(self, obs: dict, shape: tuple, raw_obs: Any = None) -> np.ndarray:
         """
         Build a binary (H, W) uint8 object mask for ROCKET-1.
 
         Strategy (in order of preference):
-        1. Use target_voxel from VoxelGatherWrapper obs to highlight columns
-           where the target block appears in the voxel grid.
-        2. Fall back to all-ones (full frame) mask — ROCKET-1 still navigates
-           and mines reasonably; just without object-level grounding.
+        1. Voxel data from raw MineDojo obs (raw_obs["voxels"]["block_name"]).
+           Project 3-D voxel positions to image columns/rows using a simple
+           perspective heuristic.  MineDojo voxels are a centred grid; the
+           agent is at the centre voxel.  Axes: X=east, Y=up, Z=south.
+           Because Minecraft camera looks in the –Z or +Z direction depending
+           on yaw, we use a simplified mapping:
+             • forward voxels  → centre columns
+             • left/right      → left/right columns
+             • high Y          → upper rows, low Y → lower rows
+        2. pre-processed target_voxel in obs (legacy VoxelGatherWrapper path).
+        3. Full-frame fallback — ROCKET-1 still navigates/mines, just without
+           object-level spatial grounding.
         """
         H, W = shape
-        target_voxel = obs.get("target_voxel", None)
 
+        # ── 1. Voxel data from raw MineDojo obs ───────────────────────────────
+        if raw_obs is not None and isinstance(raw_obs, dict):
+            mask = self._voxel_to_mask(raw_obs, H, W)
+            if mask is not None:
+                return mask
+
+        # ── 2. Legacy pre-processed target_voxel (VoxelGatherWrapper) ─────────
+        target_voxel = obs.get("target_voxel", None) if isinstance(obs, dict) else None
         if target_voxel is not None and np.any(target_voxel > 0):
-            # target_voxel is flat (voxel_dim,) — reshape to (X, Y, Z)
-            # voxel grid is centred on agent; project onto image plane (simple
-            # column-projection: any voxel in front → centre strip of image)
             mask = np.zeros((H, W), dtype=np.uint8)
-            # Simple heuristic: if any target voxel exists, highlight centre 50%
-            # of the frame (where the target block is most likely to appear)
             x0, x1 = W // 4, 3 * W // 4
             y0, y1 = H // 4, 3 * H // 4
             mask[y0:y1, x0:x1] = 1
             return mask
 
-        # Full-frame fallback
+        # ── 3. Full-frame fallback ─────────────────────────────────────────────
         return np.ones((H, W), dtype=np.uint8)
+
+    def _voxel_to_mask(self, raw_obs: dict, H: int, W: int) -> Optional[np.ndarray]:
+        """
+        Project MineDojo voxel data to a (H, W) uint8 mask using a perspective
+        camera model derived from the agent's pitch/yaw.
+
+        MineDojo voxels are a 5×5×5 grid (when use_voxel=True with xmin/xmax=±2)
+        in world coordinates: +X=east, +Y=up, +Z=south.  The agent is at the
+        centre cell (2, 2, 2).
+
+        We rotate each target-block's world-relative offset into camera space
+        using the agent's pitch and yaw from location_stats, then apply a
+        pinhole-camera perspective division to obtain (u, v) image coordinates.
+
+        Minecraft yaw convention (degrees):
+          0   → facing south (+Z)
+          90  → facing west  (-X)
+          180 → facing north (-Z)
+          -90 → facing east  (+X)
+
+        Minecraft pitch convention (degrees):
+          0    → horizontal
+          -90  → looking up   (-Y)
+          +90  → looking down (+Y)
+
+        Returns None if voxel data is absent or no in-front target block found.
+        """
+        import math
+        try:
+            from dia.evgs_minedojo import SKILL_TARGETS
+        except ImportError:
+            return None
+
+        targets = {t.lower() for t in SKILL_TARGETS.get(self.skill_name, [])}
+        if not targets:
+            return None
+
+        voxel_obs = raw_obs.get("voxels", None)
+        if voxel_obs is None:
+            return None
+
+        try:
+            # ── Extract block_name array ──────────────────────────────────────
+            if isinstance(voxel_obs, dict):
+                block_names = voxel_obs.get("block_name", None)
+            elif hasattr(voxel_obs, "dtype") and getattr(voxel_obs.dtype, "names", None):
+                block_names = (voxel_obs["block_name"]
+                               if "block_name" in voxel_obs.dtype.names else None)
+            else:
+                block_names = None
+
+            if block_names is None:
+                return None
+
+            bn_arr = np.asarray(block_names)
+            if bn_arr.ndim < 3:
+                return None
+
+            X, Y, Z = bn_arr.shape
+            cx, cy, cz = X // 2, Y // 2, Z // 2   # agent index in grid
+
+            # ── Agent camera matrix from pitch / yaw ──────────────────────────
+            loc = raw_obs.get("location_stats", {}) or {}
+            def _flt(d, k, default=0.0):
+                v = d.get(k, default)
+                if v is None: return default
+                try: return float(np.asarray(v).ravel()[0])
+                except: return default
+
+            yaw_deg   = _flt(loc, "yaw",   0.0)
+            pitch_deg = _flt(loc, "pitch", 0.0)
+            ya = math.radians(yaw_deg)
+            pa = math.radians(pitch_deg)
+
+            # Camera forward (+Z_cam = player look direction)
+            # In world XYZ: fx=-sin(ya)*cos(pa), fy=-sin(pa), fz=cos(ya)*cos(pa)
+            fw = np.array([
+                -math.sin(ya) * math.cos(pa),
+                -math.sin(pa),
+                 math.cos(ya) * math.cos(pa),
+            ], dtype=float)
+
+            # Camera right (+X_cam = right in view)
+            # right = normalize(cross(world_up, fw))
+            world_up = np.array([0.0, 1.0, 0.0])
+            rt = np.cross(world_up, fw)
+            rt_norm = np.linalg.norm(rt)
+            if rt_norm < 1e-6:
+                rt = np.array([1.0, 0.0, 0.0])
+            else:
+                rt = rt / rt_norm
+
+            # Camera up (+Y_cam = upward in view) = fw × right (left-hand rule)
+            up = np.cross(fw, rt)
+
+            # ── Project each target voxel into image coordinates ──────────────
+            iy_list, ix_list = [], []
+            for xi in range(X):
+                for yi in range(Y):
+                    for zi in range(Z):
+                        name = str(bn_arr[xi, yi, zi]).lower().strip().rstrip("\x00")
+                        if name not in targets:
+                            continue
+
+                        # World-relative offset (voxel centre; +0.5 = halfway into cell)
+                        world_off = np.array([
+                            float(xi - cx),
+                            float(yi - cy),
+                            float(zi - cz),
+                        ], dtype=float)
+
+                        # Camera-space components
+                        fwd_dist = float(np.dot(fw, world_off))
+                        if fwd_dist <= 0.1:  # behind or at agent
+                            continue
+
+                        x_cam = float(np.dot(rt, world_off))
+                        y_cam = float(np.dot(up, world_off))
+
+                        # Pinhole perspective (focal length = 0.5 normalised units)
+                        # gives ~90° FoV matching Minecraft's 70° (close enough)
+                        FOCAL = 1.0
+                        u = (x_cam / (fwd_dist * FOCAL)) * 0.5 + 0.5   # [0,1]
+                        v = (-y_cam / (fwd_dist * FOCAL)) * 0.5 + 0.5  # [0,1]; +y=down
+
+                        img_x = int(np.clip(u * W, 0, W - 1))
+                        img_y = int(np.clip(v * H, 0, H - 1))
+                        iy_list.append(img_y)
+                        ix_list.append(img_x)
+
+            if not ix_list:
+                # Target exists somewhere in grid but all behind player — use
+                # full-frame so ROCKET-1 can turn around.
+                return None
+
+            # Paint blobs at projected target positions
+            mask = np.zeros((H, W), dtype=np.uint8)
+            blob = max(H // 8, 12)
+            for iy, ix in zip(iy_list, ix_list):
+                y0, y1 = max(0, iy - blob), min(H, iy + blob)
+                x0, x1 = max(0, ix - blob), min(W, ix + blob)
+                mask[y0:y1, x0:x1] = 1
+            return mask
+
+        except Exception as exc:
+            logger.debug("_voxel_to_mask error (%s) — using fallback", exc)
+            return None
 
     def _get_rgb_224(self, obs: dict) -> np.ndarray:
         """

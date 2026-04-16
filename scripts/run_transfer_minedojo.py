@@ -209,7 +209,8 @@ _GATHER_SKILLS: frozenset = frozenset(
 )
 
 
-def make_env_minedojo(evgs, image_size: tuple = (64, 64)) -> tuple[Any, str]:
+def make_env_minedojo(evgs, image_size: tuple = (64, 64),
+                      use_voxel: bool = False) -> tuple[Any, str]:
     """
     Create and wrap a 3D Minecraft environment.
 
@@ -220,6 +221,10 @@ def make_env_minedojo(evgs, image_size: tuple = (64, 64)) -> tuple[Any, str]:
     image_size : (H, W) tuple
         Passed to minedojo.make(). Use (224, 224) with --backbone rocket1 so
         ROCKET-1's SAM-2 visual grounding operates at native training resolution.
+    use_voxel : bool
+        If True, request voxel observations from MineDojo.  Voxels provide
+        block_name + cos_look_vec_angle arrays for a 5×5×5 grid centred on the
+        agent, enabling proper spatial mask generation for ROCKET-1.
 
     Returns
     -------
@@ -230,7 +235,19 @@ def make_env_minedojo(evgs, image_size: tuple = (64, 64)) -> tuple[Any, str]:
     # ── Try MineDojo ─────────────────────────────────────────────────────────
     try:
         import minedojo
-        raw = minedojo.make(task_id="open-ended", image_size=image_size)
+        make_kwargs: dict = dict(task_id="open-ended", image_size=image_size)
+        if use_voxel:
+            # 5×5×5 grid: 2 blocks in each direction from agent.
+            # block_name + cos_look_vec_angle let ROCKET-1 adapter build
+            # a per-frame segmentation mask without SAM-2.
+            make_kwargs["use_voxel"] = True
+            make_kwargs["voxel_size"] = dict(
+                xmin=-2, xmax=2,
+                ymin=-2, ymax=2,
+                zmin=-2, zmax=2,
+            )
+            print("  [env] voxel observations enabled (5×5×5 grid)")
+        raw = minedojo.make(**make_kwargs)
         wrapped = MinedojoObsWrapper(raw, evgs)
         return wrapped, _MINEDOJO_ENV_ID
     except Exception as md_exc:
@@ -365,10 +382,12 @@ def run_experiment(args) -> Dict[str, Any]:
     # ── Create environment ────────────────────────────────────────────────
     # Use 224×224 for ROCKET-1 so SAM-2 operates at training resolution;
     # 64×64 suffices for BC policies and scripted options.
-    img_size = (224, 224) if backbone == "rocket1" else (64, 64)
-    print(f"\nCreating 3D Minecraft env (image_size={img_size}, MineDojo primary, MineRL fallback)...")
+    img_size    = (224, 224) if backbone == "rocket1" else (64, 64)
+    need_voxel  = backbone == "rocket1"
+    print(f"\nCreating 3D Minecraft env (image_size={img_size}, voxel={need_voxel}, "
+          f"MineDojo primary, MineRL fallback)...")
     try:
-        env, env_id = make_env_minedojo(evgs, image_size=img_size)
+        env, env_id = make_env_minedojo(evgs, image_size=img_size, use_voxel=need_voxel)
     except Exception as exc:
         print(f"ERROR: could not create any 3D env: {exc}")
         return {
