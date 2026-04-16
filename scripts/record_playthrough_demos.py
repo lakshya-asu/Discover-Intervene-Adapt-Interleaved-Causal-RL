@@ -305,14 +305,35 @@ def _build_action(noop: Dict) -> Dict:
 _WINDOW_KEEPER_RUNNING = False
 
 
+# Center monitor geometry (DP-0: 1920x1080 at offset 1080,546 on DISPLAY=:0)
+_MC_WIN_X = 1080
+_MC_WIN_Y = 546
+_MC_WIN_W = 1920
+_MC_WIN_H = 1080
+
+
 def _raise_minecraft_window_once() -> Optional[str]:
-    """Find and raise every Minecraft window on the current DISPLAY."""
+    """Find and raise every Minecraft window, positioning it on the center monitor."""
     try:
         import subprocess
+        display_env = os.environ.get("DISPLAY", ":0")
+
+        # Try wmctrl first (simpler, handles window manager decorations)
+        r = subprocess.run(
+            ["wmctrl", "-r", "Minecraft", "-e",
+             f"0,{_MC_WIN_X},{_MC_WIN_Y},{_MC_WIN_W},{_MC_WIN_H}"],
+            capture_output=True, timeout=3,
+        )
+        if r.returncode == 0:
+            # Also raise to front
+            subprocess.run(["wmctrl", "-r", "Minecraft", "-b", "add,above"],
+                           capture_output=True, timeout=3)
+            return "wmctrl"
+
+        # Fallback: Xlib
         from Xlib import display as _xdisp, X
         from Xlib.protocol import event as _xevent
 
-        display_env = os.environ.get("DISPLAY", ":1")
         result = subprocess.run(
             ["xwininfo", "-root", "-children", "-display", display_env],
             capture_output=True, text=True, timeout=5,
@@ -332,7 +353,7 @@ def _raise_minecraft_window_once() -> Optional[str]:
             win = d.create_resource_object("window", int(win_id, 16))
             win.map()
             d.sync()
-            win.configure(x=0, y=0, width=1280, height=720)
+            win.configure(x=_MC_WIN_X, y=_MC_WIN_Y, width=_MC_WIN_W, height=_MC_WIN_H)
             d.sync()
             ev = _xevent.ClientMessage(
                 window=win,
@@ -504,13 +525,24 @@ def _record_seed(
     args: argparse.Namespace,
     manifest: List[Dict],
 ) -> bool:
-    """Record all skills for one seed.  Returns False if the user pressed F12."""
+    """Record all skills for one seed in a single continuous world session.
+
+    The world is loaded ONCE per seed.  Between skills only /give commands
+    run — no world reset — so the player stays in the same terrain throughout
+    the full wood→diamond playthrough.  The world only reloads when moving to
+    the next seed.
+
+    Returns False if the user pressed F12 (quit).
+    """
     global _recording, _advance, _quit
 
     logger.info("\n%s\n%s  seed=%d\n%s", "="*70, seed_label, seed, "="*70)
     env = _make_env(seed)
     obs, info = env.reset()
-    _show_minecraft_window()   # raise game window so user can see and interact
+
+    # Apply common setup once for this world (hunger off, time lock, effects)
+    obs, info = _exec_cmds(env, obs, info, list(_COMMON_SETUP))
+    _show_minecraft_window()
 
     try:
         noop_action = env.noop_action()
@@ -526,7 +558,12 @@ def _record_seed(
         skill = SKILL_SEQUENCE[skill_idx]
         seg_idx = _next_seg_idx(args.out_dir, skill)
 
-        # Reset per-skill state
+        # Apply only skill-specific /give commands — NO env.reset() between skills
+        skill_cmds = _SKILL_SETUP.get(skill, [])
+        if skill_cmds:
+            obs, info = _exec_cmds(env, obs, info, skill_cmds)
+
+        # Reset per-skill recording state
         _recording = False
         _advance = False
         with _annot_lock:
@@ -540,9 +577,6 @@ def _record_seed(
             _SKILL_DESCRIPTIONS.get(skill, ""),
             "="*70,
         )
-        obs, info = env.reset()
-        obs, info = _setup_skill(env, obs, info, skill)
-
         logger.info(
             "\n"
             "  Will save → %s/%s/demo_%03d.mp4\n"
@@ -571,10 +605,13 @@ def _record_seed(
                 actions.append(act)
                 globals()["_current_frame"] = len(frames) - 1
 
+            # If the episode ends unexpectedly (death etc.), reset and re-apply setup
             if terminated or truncated:
-                logger.info("[%s] Episode ended — resetting...", skill)
+                logger.warning("[%s] Unexpected episode end — respawning in same world.", skill)
                 obs, info = env.reset()
-                obs, info = _setup_skill(env, obs, info, skill)
+                obs, info = _exec_cmds(env, obs, info, list(_COMMON_SETUP))
+                if skill_cmds:
+                    obs, info = _exec_cmds(env, obs, info, skill_cmds)
 
             elapsed = time.perf_counter() - t0
             wait = tick - elapsed
