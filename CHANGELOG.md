@@ -136,6 +136,36 @@ Fix: unwrap one level with `getattr(env, "_env", env)` before looking up `.env`.
 
 ---
 
+## it8 — Revert to it5 logic + hotbar equip fix + playthrough demo recorder
+
+**Changes from it7:**
+- Reverted to **it5 scan-phase logic**: `_UNDERGROUND_SWEEP` scan phase uses `force_attack=0` (GROOT controls attack), restoring visual goal-following behaviour that was lost in it6
+- `_GATHER_MIN_QTY["wood"]`: reverted to 5 (it5 value); it6/it7 used 3 and correlated with worse behaviour
+- `_GATHER_MIN_QTY["stone"]`: 11 (unchanged)
+- Added `_equip_pickaxe()`: uses `/item replace entity @p hotbar.0 <pickaxe> 1` to put the correct pickaxe in hotbar slot 0 before each underground gather skill
+  - stone → wooden_pickaxe, coal/ironore → stone_pickaxe, diamond → iron_pickaxe
+  - Fixes bare-hands ironore mining (zero drops) observed in it7: agent had stone_pickaxe in inventory but not equipped
+- Added `scripts/record_playthrough_demos.py`: full tech-tree sequential demo recorder
+  - Covers all 10 skills: wood → woodpickaxe → stone → coal → furnace → stonepickaxe → ironore → iron → ironpickaxe → diamond
+  - Per-skill setup: gives prerequisite items + equips correct pickaxe in slot 1 via `/item replace`
+  - `--start_skill` flag to resume from interrupted session
+  - Saves MP4 + BC `.npz` per segment; auto-increments index if demos already exist
+- Retained from it7: water_breathing, fire_resistance, torch give, video recording, `/give` wrapper fix
+
+**Root cause identified (coal never found):**
+User observed during it7 run: agent walked past multiple coal blocks in a cavern without attacking them.
+GROOT's visual goal-following triggers attack when the reference clip matches — but clips show mid-mining state
+(already adjacent to ore face). Agent hasn't learned to approach and initiate attack from a distance.
+Primary fix path: collect full-playthrough demos via `record_playthrough_demos.py` where the human
+demonstrates approach + initiation for each skill.
+
+**Results:**
+| Seed | n_achieved | notes |
+|------|-----------|-------|
+| TBD | TBD | — |
+
+---
+
 ## Known Issues / Open Problems
 
 | Problem | Status | Evidence |
@@ -145,6 +175,7 @@ Fix: unwrap one level with `getattr(env, "_env", env)` before looking up `.env`.
 | Underground primer walks agent into water | ⚠️ Terrain-dependent | GROOT outputs jump+forward during pitch-down on some spawns |
 | Wood min_qty=3 not yet measured on normal spawn | ⏳ Pending | it6 seeds had spawn wood; it7 s1 wood failed entirely |
 | _VideoRecordingEnv breaks /give fallback | ✅ Fixed (it7.1) | `_give_item` now unwraps `_env` before seeking `execute_cmd` |
+| Iron ore mined with bare hands (zero drops) | ✅ Fixed (it8) | `_equip_pickaxe()` puts correct pickaxe in hotbar.0 before each underground gather |
 | Diamond never found | ❌ Unsolved | Requires ironore → iron → ironpickaxe first |
 
 ---
@@ -166,4 +197,4 @@ Fix: unwrap one level with `getattr(env, "_env", env)` before looking up `.env`.
 
 **Best legitimate performance:** it4 seed 1 (ironore found by staircase, not spawn luck).  
 **Best agent behaviour quality:** it4/it5 — GROOT's visual goal-following during scan sweep produced purposeful ore-seeking. Force-attack override in it6 removed this and made the agent dumber.  
-**Active codebase (it8):** it5 logic (wood min_qty=5, GROOT controls scan attack) + torches + water/fire effects + video recording + /give wrapper fix.
+**Active codebase (it8):** it5 logic (wood min_qty=5, GROOT controls scan attack) + torches + water/fire effects + video recording + /give wrapper fix + hotbar pickaxe equip before underground gather.

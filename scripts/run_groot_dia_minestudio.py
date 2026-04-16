@@ -297,6 +297,57 @@ def _inventory_summary(info: Dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tool equipping — put the right pickaxe in hotbar slot 1 before mining
+# ---------------------------------------------------------------------------
+
+# Which pickaxe tier is needed to mine each underground resource
+_SKILL_PICKAXE: Dict[str, str] = {
+    "stone":   "minecraft:wooden_pickaxe",
+    "coal":    "minecraft:stone_pickaxe",
+    "ironore": "minecraft:stone_pickaxe",
+    "diamond": "minecraft:iron_pickaxe",
+}
+
+
+def _equip_pickaxe(skill_name: str, env: Any, obs: Dict, info: Dict) -> Tuple[Dict, Dict]:
+    """Place the required pickaxe for *skill_name* into hotbar slot 1.
+
+    Uses /item replace (1.17+) with /replaceitem fallback (1.16 and older).
+    If neither works, logs a warning and returns unchanged obs/info — the run
+    continues but mining yield will be zero if the wrong tool is held.
+    """
+    pickaxe = _SKILL_PICKAXE.get(skill_name)
+    if pickaxe is None:
+        return obs, info  # surface skill, no pickaxe needed
+
+    _real = getattr(env, "_env", env)
+    inner = getattr(_real, "env", None)
+    if inner is None or not hasattr(inner, "execute_cmd"):
+        logger.warning("[%s] _equip_pickaxe: execute_cmd unavailable", skill_name)
+        return obs, info
+
+    # Try modern syntax first, then legacy
+    cmds = [
+        f"/item replace entity @p hotbar.0 {pickaxe} 1",
+        f"/replaceitem entity @p slot.hotbar.0 {pickaxe} 1",
+    ]
+    for cmd in cmds:
+        try:
+            raw_obs, _rw, _dn, raw_info = inner.execute_cmd(cmd)
+            obs, info = env._wrap_obs_info(raw_obs, raw_info)
+            # Step noop so client renders the hotbar change
+            noop = env.noop_action()
+            obs, _, _t, _tr, info = env.step(noop)
+            logger.info("[%s] pickaxe equipped in slot 1: %s", skill_name, pickaxe)
+            return obs, info
+        except Exception as exc:
+            logger.debug("[%s] equip cmd failed (%s): %s", skill_name, cmd, exc)
+
+    logger.warning("[%s] could not equip pickaxe %s — agent may mine bare-handed", skill_name, pickaxe)
+    return obs, info
+
+
+# ---------------------------------------------------------------------------
 # /give fallback for CRAFT skills only
 # ---------------------------------------------------------------------------
 
@@ -846,6 +897,12 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
         is_gather = skill_name in GATHER_SKILLS
         primer_type = "underground" if skill_name in UNDERGROUND_GATHER else "surface"
         primer_n = (200 if primer_type == "underground" else args.primer_steps) if is_gather else 0
+
+        # Equip the correct pickaxe in hotbar slot 1 before any underground gather.
+        # Without this the agent mines with whatever is in hand — bare fists for
+        # ironore produce zero drops even if the ore face is hit correctly.
+        if skill_name in UNDERGROUND_GATHER:
+            obs, info = _equip_pickaxe(skill_name, env, obs, info)
 
         # Snapshot inventory state before attempt (for online causal learning)
         inv_before = _inv_state_vector(info)
