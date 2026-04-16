@@ -29,10 +29,13 @@ Controls:
   F11            — stop + save, advance to next skill
   F12            — quit
 
-Annotation bookmarks (F5):
-  Each press logs {"frame": N, "time_sec": T, "label": "mark_N"} to a JSON sidecar.
-  Useful for marking moments like "approaching ore", "initiating attack", "first pickup".
-  The JSON is saved alongside the MP4 and BC npz for post-processing / clip slicing.
+Annotation segments (F5):
+  Press F5 to END the current labeled segment and START a new one.
+  The game pauses, the terminal prompts you to type a description of what you're
+  about to do (e.g. "walking toward coal vein", "mining coal with pickaxe", "placing torch").
+  Press Enter — game resumes and all frames until the next F5 are tagged with that label.
+  Segments are saved as {"start_frame": N, "end_frame": M, "label": "..."} in a JSON
+  sidecar alongside the MP4 and BC npz.  Use them to slice targeted fine-tuning clips.
 
 Usage:
   conda run -n dia-minecraft python scripts/record_playthrough_demos.py \\
@@ -176,27 +179,39 @@ _recording: bool = False
 _advance: bool = False   # F11 — save and go to next skill
 _quit: bool = False
 _prev_mouse: Optional[Tuple[float, float]] = None
-_annotations: List[Dict] = []     # accumulated F5 bookmarks for current segment
+
+# ---------------------------------------------------------------------------
+# Annotation state
+#
+# Annotations are LABELED SEGMENTS, not single-frame bookmarks.
+# Workflow:
+#   1. Press F5 → game pauses, terminal prompts for description of what
+#      you're about to do ("chopping tree", "mining coal vein", etc.)
+#   2. Type description + Enter → recording resumes under that label
+#   3. Press F5 again → ends the current segment, prompts for the next one
+#
+# Each segment saved: {"start_frame": N, "end_frame": M, "label": "..."}
+# ---------------------------------------------------------------------------
+_annotation_segments: List[Dict] = []   # completed labeled segments
 _annot_lock = threading.Lock()
-_current_frame: int = 0           # frame counter written by the main loop
+_current_label: Optional[str] = None    # label currently active (or None)
+_label_start_frame: int = 0             # frame where current label began
+_current_frame: int = 0                 # written by the main loop each frame
+_waiting_for_label: bool = False        # F5 sets this; main loop reads and clears
+_in_label_input: bool = False           # True while main loop is in input()
 
 
 def _on_key_press(key: Any) -> None:
-    global _recording, _advance, _quit, _HOTBAR
+    global _recording, _advance, _quit, _HOTBAR, _waiting_for_label
     try:
         if key == _kb.Key.f5:
+            if _in_label_input:
+                return  # ignore F5 while user is typing
             if _recording:
-                with _annot_lock:
-                    idx = len(_annotations)
-                    mark = {
-                        "frame":    _current_frame,
-                        "time_sec": round(time.monotonic(), 3),
-                        "label":    f"mark_{idx}",
-                    }
-                    _annotations.append(mark)
-                logger.info("[recorder] Annotation %d at frame %d", idx, _current_frame)
+                _waiting_for_label = True
+                # log will appear after the input() prompt clears
             else:
-                logger.info("[recorder] F5 pressed but not recording — ignored")
+                logger.info("[recorder] F5: not recording — press F10 first")
             return
         if key == _kb.Key.f10:
             if not _recording:
@@ -483,10 +498,19 @@ def _save_segment(
     if annotations:
         annot_path = os.path.join(skill_dir, f"{tag}_annotations.json")
         with open(annot_path, "w") as fh:
-            json.dump({"skill": skill, "segment": seg_idx,
-                       "total_frames": len(frames), "fps": fps,
-                       "annotations": annotations}, fh, indent=2)
-        logger.info("Saved: %s  (%d annotations)", annot_path, len(annotations))
+            json.dump({
+                "skill": skill,
+                "segment": seg_idx,
+                "total_frames": len(frames),
+                "fps": fps,
+                "labeled_segments": annotations,
+                # Convenience: frames not covered by any segment are "unlabeled"
+                "note": (
+                    "Each entry has start_frame, end_frame (inclusive), and label (str). "
+                    "Use these to slice obs/bc arrays for targeted fine-tuning."
+                ),
+            }, fh, indent=2)
+        logger.info("Saved: %s  (%d labeled segments)", annot_path, len(annotations))
 
     logger.info("Saved: %s  (%d frames)", mp4, len(frames))
     return mp4
@@ -566,9 +590,12 @@ def _record_seed(
         # Reset per-skill recording state
         _recording = False
         _advance = False
-        with _annot_lock:
-            _annotations.clear()
+        globals()["_waiting_for_label"] = False
+        globals()["_current_label"] = None
+        globals()["_label_start_frame"] = 0
         globals()["_current_frame"] = 0
+        with _annot_lock:
+            _annotation_segments.clear()
 
         logger.info(
             "\n%s\n%s  Skill %d/%d: %s\n  %s\n%s",
@@ -591,6 +618,43 @@ def _record_seed(
         actions: List[Dict] = []
 
         while not _quit and not _advance:
+            # --- Handle label-prompt triggered by F5 ---
+            if _waiting_for_label:
+                globals()["_in_label_input"] = True
+                # Close the current segment if one was active
+                cur_label = globals()["_current_label"]
+                if cur_label is not None:
+                    with _annot_lock:
+                        _annotation_segments.append({
+                            "start_frame": globals()["_label_start_frame"],
+                            "end_frame":   globals()["_current_frame"],
+                            "label":       cur_label,
+                        })
+                    logger.info("[annot] Segment closed: '%s' frames %d–%d",
+                                cur_label,
+                                globals()["_label_start_frame"],
+                                globals()["_current_frame"])
+                    globals()["_current_label"] = None
+
+                # Prompt in terminal (blocks game loop — that's fine)
+                print("\n" + "─"*60)
+                print(f"  Annotating skill: {skill.upper()}")
+                print("  Describe what you are about to do (or press Enter to skip):")
+                print("  Examples: 'walking to coal vein', 'mining coal with pickaxe',")
+                print("            'navigating down to y=11', 'placing torch for light'")
+                label = input("  >>> ").strip()
+
+                if label:
+                    globals()["_current_label"] = label
+                    globals()["_label_start_frame"] = globals()["_current_frame"]
+                    logger.info("[annot] Segment started: '%s' at frame %d", label, globals()["_current_frame"])
+                else:
+                    logger.info("[annot] No label entered — continuing unlabeled")
+
+                globals()["_waiting_for_label"] = False
+                globals()["_in_label_input"] = False
+                print("─"*60 + "\n")
+
             t0 = time.perf_counter()
 
             act = _build_action(noop_action)
@@ -618,9 +682,19 @@ def _record_seed(
             if wait > 0:
                 time.sleep(wait)
 
+        # Close the last open annotation segment on F11/F12
+        if globals()["_current_label"] is not None:
+            with _annot_lock:
+                _annotation_segments.append({
+                    "start_frame": globals()["_label_start_frame"],
+                    "end_frame":   globals()["_current_frame"],
+                    "label":       globals()["_current_label"],
+                })
+            globals()["_current_label"] = None
+
         if frames:
             with _annot_lock:
-                annots = list(_annotations)
+                annots = list(_annotation_segments)
             mp4 = _save_segment(skill, seg_idx, frames, actions, annots, args.out_dir, args.fps)
             entry = {
                 "seed": seed, "skill": skill, "segment": seg_idx,
