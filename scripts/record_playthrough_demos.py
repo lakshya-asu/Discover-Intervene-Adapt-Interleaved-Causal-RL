@@ -302,16 +302,96 @@ def _build_action(noop: Dict) -> Dict:
 # Env helpers
 # ---------------------------------------------------------------------------
 
+_WINDOW_KEEPER_RUNNING = False
+
+
+def _raise_minecraft_window_once() -> Optional[str]:
+    """Find and raise every Minecraft window on the current DISPLAY."""
+    try:
+        import subprocess
+        from Xlib import display as _xdisp, X
+        from Xlib.protocol import event as _xevent
+
+        display_env = os.environ.get("DISPLAY", ":1")
+        result = subprocess.run(
+            ["xwininfo", "-root", "-children", "-display", display_env],
+            capture_output=True, text=True, timeout=5,
+        )
+        win_ids = [
+            line.strip().split()[0]
+            for line in result.stdout.splitlines()
+            if "Minecraft" in line and "0x" in line
+        ]
+        if not win_ids:
+            return None
+
+        d = _xdisp.Display(display_env)
+        root = d.screen().root
+        NET_ACTIVE = d.intern_atom("_NET_ACTIVE_WINDOW")
+        for win_id in win_ids:
+            win = d.create_resource_object("window", int(win_id, 16))
+            win.map()
+            d.sync()
+            win.configure(x=0, y=0, width=1280, height=720)
+            d.sync()
+            ev = _xevent.ClientMessage(
+                window=win,
+                client_type=NET_ACTIVE,
+                data=(32, [2, X.CurrentTime, 0, 0, 0]),
+            )
+            root.send_event(ev, event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask)
+        d.sync()
+        return win_ids[-1]
+    except Exception as exc:
+        logger.debug("_raise_minecraft_window_once: %s", exc)
+        return None
+
+
+def _show_minecraft_window(interval: int = 15) -> None:
+    """Raise the Minecraft window now and keep re-raising it every *interval* seconds."""
+    global _WINDOW_KEEPER_RUNNING
+
+    win_id = None
+    for _ in range(20):          # poll up to 10 s for the window to appear
+        win_id = _raise_minecraft_window_once()
+        if win_id:
+            break
+        time.sleep(0.5)
+
+    if win_id:
+        logger.info("Minecraft window raised to 0,0 (1280x720)")
+    else:
+        logger.warning("Minecraft window not found — may need to view DISPLAY=%s manually",
+                       os.environ.get("DISPLAY", ":1"))
+
+    if _WINDOW_KEEPER_RUNNING:
+        return
+    _WINDOW_KEEPER_RUNNING = True
+
+    def _keeper():
+        while True:
+            time.sleep(interval)
+            try:
+                _raise_minecraft_window_once()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_keeper, daemon=True, name="mc-window-keeper")
+    t.start()
+    logger.info("Window keeper started (re-raises every %ds)", interval)
+
+
 def _make_env(seed: int) -> Any:
     from minestudio.simulator import MinecraftSim
     from minestudio.simulator.entry import check_engine
     check_engine(skip_confirmation=True)
-    return MinecraftSim(
+    env = MinecraftSim(
         action_type="agent",
         obs_size=(224, 224),
         preferred_spawn_biome="forest",
         seed=seed,
     )
+    return env
 
 
 def _exec_cmds(env: Any, obs: Dict, info: Dict, cmds: List[str]) -> Tuple[Dict, Dict]:
@@ -430,6 +510,7 @@ def _record_seed(
     logger.info("\n%s\n%s  seed=%d\n%s", "="*70, seed_label, seed, "="*70)
     env = _make_env(seed)
     obs, info = env.reset()
+    _show_minecraft_window()   # raise game window so user can see and interact
 
     try:
         noop_action = env.noop_action()
