@@ -5,8 +5,9 @@ Full tech-tree playthrough demo recorder.
 Records human demonstrations of every skill in the DIA Minecraft tech tree,
 one skill at a time, in the correct causal order. Each segment is saved as:
 
-  <out_dir>/<skill>/<tag>.mp4        — reference video clip (GROOT conditioning)
-  <out_dir>/<skill>/<tag>_bc.npz    — obs + action arrays (BC fine-tuning)
+  <out_dir>/<skill>/<tag>.mp4               — reference video clip (GROOT conditioning)
+  <out_dir>/<skill>/<tag>_bc.npz           — obs + action arrays (BC fine-tuning)
+  <out_dir>/<skill>/<tag>_annotations.json — frame-level bookmarks (optional)
 
 The player completes each skill in a single live session. Between skills the
 environment is reset and pre-loaded with the required prerequisites (crafted
@@ -23,9 +24,15 @@ Controls:
   1-9            — hotbar slot
   Q              — drop item
   ---
+  F5             — drop annotation bookmark at current frame (can press multiple times)
   F10            — start recording this skill's segment
   F11            — stop + save, advance to next skill
   F12            — quit
+
+Annotation bookmarks (F5):
+  Each press logs {"frame": N, "time_sec": T, "label": "mark_N"} to a JSON sidecar.
+  Useful for marking moments like "approaching ore", "initiating attack", "first pickup".
+  The JSON is saved alongside the MP4 and BC npz for post-processing / clip slicing.
 
 Usage:
   conda run -n dia-minecraft python scripts/record_playthrough_demos.py \\
@@ -40,6 +47,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -168,11 +176,28 @@ _recording: bool = False
 _advance: bool = False   # F11 — save and go to next skill
 _quit: bool = False
 _prev_mouse: Optional[Tuple[float, float]] = None
+_annotations: List[Dict] = []     # accumulated F5 bookmarks for current segment
+_annot_lock = threading.Lock()
+_current_frame: int = 0           # frame counter written by the main loop
 
 
 def _on_key_press(key: Any) -> None:
     global _recording, _advance, _quit, _HOTBAR
     try:
+        if key == _kb.Key.f5:
+            if _recording:
+                with _annot_lock:
+                    idx = len(_annotations)
+                    mark = {
+                        "frame":    _current_frame,
+                        "time_sec": round(time.monotonic(), 3),
+                        "label":    f"mark_{idx}",
+                    }
+                    _annotations.append(mark)
+                logger.info("[recorder] Annotation %d at frame %d", idx, _current_frame)
+            else:
+                logger.info("[recorder] F5 pressed but not recording — ignored")
+            return
         if key == _kb.Key.f10:
             if not _recording:
                 _recording = True
@@ -324,6 +349,7 @@ def _save_segment(
     seg_idx: int,
     frames: List[np.ndarray],
     actions: List[Dict],
+    annotations: List[Dict],
     out_dir: str,
     fps: int = 20,
 ) -> str:
@@ -352,6 +378,15 @@ def _save_segment(
 
     np.savez_compressed(npz, obs=np.stack(frames), bool_actions=bool_arr,
                         bool_keys=np.array(BOOL_KEYS), camera=camera_arr)
+
+    if annotations:
+        annot_path = os.path.join(skill_dir, f"{tag}_annotations.json")
+        with open(annot_path, "w") as fh:
+            json.dump({"skill": skill, "segment": seg_idx,
+                       "total_frames": len(frames), "fps": fps,
+                       "annotations": annotations}, fh, indent=2)
+        logger.info("Saved: %s  (%d annotations)", annot_path, len(annotations))
+
     logger.info("Saved: %s  (%d frames)", mp4, len(frames))
     return mp4
 
@@ -397,6 +432,9 @@ def record(args: argparse.Namespace) -> None:
         # Reset state flags
         _recording = False
         _advance = False
+        with _annot_lock:
+            _annotations.clear()
+        globals()["_current_frame"] = 0
 
         # Fresh env reset + skill setup
         logger.info("\n%s\n=== SKILL %d/%d: %s ===\n%s\n%s",
@@ -431,6 +469,7 @@ def record(args: argparse.Namespace) -> None:
             if _recording and "image" in obs:
                 frames.append(obs["image"].copy())
                 actions.append(act)
+                globals()["_current_frame"] = len(frames) - 1
 
             if terminated or truncated:
                 logger.info("[%s] Episode ended — resetting...", skill)
@@ -444,8 +483,11 @@ def record(args: argparse.Namespace) -> None:
 
         # Save whatever was recorded
         if frames:
-            _save_segment(skill, seg_idx, frames, actions, args.out_dir, args.fps)
-            logger.info("[%s] Demo %d saved (%d frames).", skill, seg_idx, len(frames))
+            with _annot_lock:
+                annots = list(_annotations)
+            _save_segment(skill, seg_idx, frames, actions, annots, args.out_dir, args.fps)
+            logger.info("[%s] Demo %d saved (%d frames, %d annotations).",
+                        skill, seg_idx, len(frames), len(annots))
         else:
             logger.info("[%s] No frames recorded — skipping save.", skill)
 

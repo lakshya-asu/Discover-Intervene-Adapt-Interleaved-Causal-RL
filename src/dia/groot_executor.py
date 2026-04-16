@@ -175,49 +175,52 @@ class GrootExecutor:
     # Navigation primers
     # ------------------------------------------------------------------
 
-    # Sweep format: (pitch_delta, yaw_delta, force_attack, force_forward)
+    # Sweep format: (pitch_delta, yaw_delta, force_attack, force_forward, freeze_movement)
     # force_attack/force_forward=1 → override GROOT's button output with 1
-    # (used during the underground dig phase where GROOT outputs NOOP because
-    # the bright-surface observation doesn't match dark-cave reference clips)
+    # freeze_movement=1 → zero ALL buttons (jump, forward, sprint, etc.) — only camera moves.
+    #   Used during the initial pitch-down so GROOT cannot run/jump into water before
+    #   the agent is facing the ground.
 
     # Surface primer: horizontal yaw sweep so the agent faces a tree/stone outcrop.
     # GROOT controls buttons throughout — it reliably produces attack+forward at
     # trunk level once the camera is aimed at a tree or stone face.
-    _SURFACE_SWEEP: List[Tuple[float, float, int, int]] = (
-        [(0.0,  15.0, 0, 0)] * 12   # turn right 180°
-        + [(0.0, -15.0, 0, 0)] * 12 # sweep back (and left 180°)
-        + [(0.0,  15.0, 0, 0)] * 6  # re-centre
-        + [(5.0,  0.0,  0, 0)] * 4  # pitch slightly down (trunk level)
-        + [(-5.0, 0.0,  0, 0)] * 4  # restore
+    _SURFACE_SWEEP: List[Tuple[float, float, int, int, int]] = (
+        [(0.0,  15.0, 0, 0, 0)] * 12   # turn right 180°
+        + [(0.0, -15.0, 0, 0, 0)] * 12 # sweep back (and left 180°)
+        + [(0.0,  15.0, 0, 0, 0)] * 6  # re-centre
+        + [(5.0,  0.0,  0, 0, 0)] * 4  # pitch slightly down (trunk level)
+        + [(-5.0, 0.0,  0, 0, 0)] * 4  # restore
     )
 
     # Underground primer: two-phase subgoal sequence.
     #
     # Subgoal 1 — Reach underground (steps 0-152):
-    #   Pitch camera to 45° and FORCE attack+forward for 150 steps, digging a
-    #   diagonal staircase.  GROOT's buttons are ignored here because the surface
-    #   visual (bright daylight) doesn't match the dark-cave BC reference clips.
-    #   150 uninterrupted steps = deepest possible descent, crossing more ore veins.
-    #   (Pausing for item collection reduced depth and caused ironore regression.)
+    #   Steps 0-2: freeze_movement=1 — only tilt camera to 45°.  GROOT would
+    #   otherwise output forward+jump, walking/jumping the agent into lakes.
+    #   Steps 3-152: FORCE attack+forward for 150 steps, digging a diagonal
+    #   staircase.  150 uninterrupted steps = deepest possible descent.
     #
     # Subgoal 2 — Visual scan for ore (steps 153-199):
-    #   Camera pitches back toward horizontal and sweeps left/right.  GROOT
-    #   controls attack — it visually identifies ore seams and attacks them.
-    #   This is the it5 behaviour: GROOT's visual goal-following drives attack
-    #   once it is at cave depth and can see ore-matching blocks.
-    _UNDERGROUND_SWEEP: List[Tuple[float, float, int, int]] = (
-        [(15.0, 0.0,  0, 0)] * 3    # pitch down to +45°  (GROOT buttons)
-        + [(0.0, 0.0,  1, 1)] * 150 # FORCED dig staircase at 45° pitch
-        + [(0.0, 15.0, 0, 0)] * 8   # sweep right (GROOT controls attack)
-        + [(0.0, -15.0,0, 0)] * 8   # sweep left  (GROOT controls attack)
-        + [(0.0, 15.0, 0, 0)] * 4   # sweep right again
-        + [(-5.0, 0.0, 0, 0)] * 5   # restore pitch toward horizontal
-        + [(0.0, 0.0,  0, 0)] * 22  # face forward (GROOT controls attack)
+    #   Camera sweeps left/right.  GROOT controls attack — visual goal-following
+    #   drives attack once at cave depth (it5 behaviour).
+    _UNDERGROUND_SWEEP: List[Tuple[float, float, int, int, int]] = (
+        [(15.0, 0.0,  0, 0, 1)] * 3    # pitch down to +45° — freeze movement (no lake-dive)
+        + [(0.0, 0.0,  1, 1, 0)] * 150 # FORCED dig staircase at 45° pitch
+        + [(0.0, 15.0, 0, 0, 0)] * 8   # sweep right (GROOT controls attack)
+        + [(0.0, -15.0,0, 0, 0)] * 8   # sweep left  (GROOT controls attack)
+        + [(0.0, 15.0, 0, 0, 0)] * 4   # sweep right again
+        + [(-5.0, 0.0, 0, 0, 0)] * 5   # restore pitch toward horizontal
+        + [(0.0, 0.0,  0, 0, 0)] * 22  # face forward (GROOT controls attack)
+    )
+
+    _FREEZE_BUTTONS: Tuple[str, ...] = (
+        "forward", "back", "left", "right",
+        "jump", "sneak", "sprint", "attack", "use",
     )
 
     def _run_primer(
         self,
-        sweep: List[Tuple[float, float, int, int]],
+        sweep: List[Tuple],
         label: str,
         clip_path: str,
         env: Any,
@@ -228,20 +231,24 @@ class GrootExecutor:
     ) -> Tuple[Dict, Dict, int]:
         """Execute a camera-override primer for *n_steps* steps.
 
-        Each sweep entry is (pitch_delta, yaw_delta, force_attack, force_forward).
-        Camera is always overridden by the program.  When force_attack/force_forward
-        are 1, those buttons are set unconditionally (overriding GROOT's prediction).
+        Each sweep entry is (pitch_delta, yaw_delta, force_attack, force_forward[, freeze_movement]).
+        Camera is always overridden by the program.
+        freeze_movement=1 zeroes all button outputs — only the camera moves (prevents
+        lake-dives during the initial pitch-down where GROOT would output forward+jump).
+        force_attack/force_forward=1 unconditionally set those buttons.
         Returns early if the skill is achieved or the episode ends.
         """
         if self._memory is None:
             self._memory = self._policy.initial_state()
 
-        # Extend sweep with no-op padding (no button overrides) if needed
-        padding = [(0.0, 0.0, 0, 0)] * max(0, n_steps - len(sweep))
-        program = (sweep + padding)[:n_steps]
+        # Extend sweep with no-op padding if needed
+        padding = [(0.0, 0.0, 0, 0, 0)] * max(0, n_steps - len(sweep))
+        program = (list(sweep) + padding)[:n_steps]
         steps_done = 0
 
-        for pitch_d, yaw_d, force_atk, force_fwd in program:
+        for step_data in program:
+            pitch_d, yaw_d, force_atk, force_fwd = step_data[:4]
+            freeze = step_data[4] if len(step_data) > 4 else 0
             try:
                 action_dict, self._memory = self._policy.get_action(
                     input={"image": obs["image"], "ref_video_path": clip_path},
@@ -252,14 +259,20 @@ class GrootExecutor:
                 # Camera always overridden by primer program
                 if "camera" in action_dict and hasattr(action_dict["camera"], "__len__"):
                     action_dict["camera"] = np.array([pitch_d, yaw_d], dtype=np.float32)
-                # Forced button overrides for dig phase
-                if force_atk:
-                    action_dict["attack"]  = 1
-                    action_dict["forward"] = 1
-                    if "sprint" in action_dict:
-                        action_dict["sprint"] = 1
-                if force_fwd and not force_atk:
-                    action_dict["forward"] = 1
+                # freeze_movement: zero all buttons so only the camera tilts
+                if freeze:
+                    for btn in self._FREEZE_BUTTONS:
+                        if btn in action_dict:
+                            action_dict[btn] = 0
+                else:
+                    # Forced button overrides for dig phase
+                    if force_atk:
+                        action_dict["attack"]  = 1
+                        action_dict["forward"] = 1
+                        if "sprint" in action_dict:
+                            action_dict["sprint"] = 1
+                    if force_fwd and not force_atk:
+                        action_dict["forward"] = 1
 
                 obs, _r, terminated, truncated, info = env.step(action_dict)
                 steps_done += 1
