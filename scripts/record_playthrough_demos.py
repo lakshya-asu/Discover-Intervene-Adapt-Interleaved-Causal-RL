@@ -402,13 +402,33 @@ def _next_seg_idx(out_dir: str, skill: str) -> int:
     return len(existing)
 
 
-def record(args: argparse.Namespace) -> None:
+def _load_manifest(out_dir: str) -> List[Dict]:
+    path = os.path.join(out_dir, "manifest.json")
+    if os.path.isfile(path):
+        with open(path) as fh:
+            return json.load(fh)
+    return []
+
+
+def _save_manifest(out_dir: str, entries: List[Dict]) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "manifest.json")
+    with open(path, "w") as fh:
+        json.dump(entries, fh, indent=2)
+
+
+def _record_seed(
+    seed: int,
+    seed_label: str,
+    start_skill_idx: int,
+    args: argparse.Namespace,
+    manifest: List[Dict],
+) -> bool:
+    """Record all skills for one seed.  Returns False if the user pressed F12."""
     global _recording, _advance, _quit
 
-    start_idx = SKILL_SEQUENCE.index(args.start_skill) if args.start_skill in SKILL_SEQUENCE else 0
-
-    logger.info("Starting demo session (seed=%d, start=%s)", args.seed, args.start_skill)
-    env = _make_env(args.seed)
+    logger.info("\n%s\n%s  seed=%d\n%s", "="*70, seed_label, seed, "="*70)
+    env = _make_env(seed)
     obs, info = env.reset()
 
     try:
@@ -416,40 +436,39 @@ def record(args: argparse.Namespace) -> None:
     except AttributeError:
         noop_action = {}
 
-    kb = _kb.Listener(on_press=_on_key_press, on_release=_on_key_release)
-    ms = _ms.Listener(on_move=_on_mouse_move, on_click=_on_mouse_click)
-    kb.start(); ms.start()
-
     tick = 1.0 / args.fps
 
-    for skill_idx in range(start_idx, len(SKILL_SEQUENCE)):
+    for skill_idx in range(start_skill_idx, len(SKILL_SEQUENCE)):
         if _quit:
             break
 
         skill = SKILL_SEQUENCE[skill_idx]
         seg_idx = _next_seg_idx(args.out_dir, skill)
 
-        # Reset state flags
+        # Reset per-skill state
         _recording = False
         _advance = False
         with _annot_lock:
             _annotations.clear()
         globals()["_current_frame"] = 0
 
-        # Fresh env reset + skill setup
-        logger.info("\n%s\n=== SKILL %d/%d: %s ===\n%s\n%s",
-                    "="*60, skill_idx + 1, len(SKILL_SEQUENCE), skill.upper(),
-                    _SKILL_DESCRIPTIONS.get(skill, ""),
-                    "="*60)
+        logger.info(
+            "\n%s\n%s  Skill %d/%d: %s\n  %s\n%s",
+            "="*70, seed_label,
+            skill_idx + 1, len(SKILL_SEQUENCE), skill.upper(),
+            _SKILL_DESCRIPTIONS.get(skill, ""),
+            "="*70,
+        )
         obs, info = env.reset()
         obs, info = _setup_skill(env, obs, info, skill)
 
         logger.info(
             "\n"
-            "  Segment will be saved as: %s/%s/demo_%03d.mp4\n"
-            "  Press F10 to START recording\n"
-            "  Press F11 to STOP + SAVE and move to next skill\n"
-            "  Press F12 to QUIT\n",
+            "  Will save → %s/%s/demo_%03d.mp4\n"
+            "  F5  = bookmark / annotate current frame\n"
+            "  F10 = START recording\n"
+            "  F11 = STOP + SAVE → next skill\n"
+            "  F12 = QUIT session\n",
             args.out_dir, skill, seg_idx,
         )
 
@@ -481,24 +500,80 @@ def record(args: argparse.Namespace) -> None:
             if wait > 0:
                 time.sleep(wait)
 
-        # Save whatever was recorded
         if frames:
             with _annot_lock:
                 annots = list(_annotations)
-            _save_segment(skill, seg_idx, frames, actions, annots, args.out_dir, args.fps)
-            logger.info("[%s] Demo %d saved (%d frames, %d annotations).",
-                        skill, seg_idx, len(frames), len(annots))
+            mp4 = _save_segment(skill, seg_idx, frames, actions, annots, args.out_dir, args.fps)
+            entry = {
+                "seed": seed, "skill": skill, "segment": seg_idx,
+                "frames": len(frames), "annotations": len(annots),
+                "mp4": mp4,
+            }
+            manifest.append(entry)
+            _save_manifest(args.out_dir, manifest)
+            logger.info("[%s] seed=%d demo_%03d saved (%d frames, %d annotations).",
+                        skill, seed, seg_idx, len(frames), len(annots))
         else:
             logger.info("[%s] No frames recorded — skipping save.", skill)
 
-    kb.stop(); ms.stop()
     try:
         env.close()
     except Exception:
         pass
 
-    done = [s for s in SKILL_SEQUENCE if os.path.isdir(os.path.join(args.out_dir, s))]
-    logger.info("\nSession complete. Skills with demos: %s", done)
+    return not _quit
+
+
+def record(args: argparse.Namespace) -> None:
+    global _quit
+
+    seeds: List[int] = args.seeds
+    start_seed_val = args.start_seed if args.start_seed is not None else seeds[0]
+    start_skill_idx = SKILL_SEQUENCE.index(args.start_skill) if args.start_skill in SKILL_SEQUENCE else 0
+
+    # Find where to resume in the seed list
+    if start_seed_val in seeds:
+        seed_start = seeds.index(start_seed_val)
+    else:
+        seed_start = 0
+
+    manifest = _load_manifest(args.out_dir)
+
+    logger.info(
+        "Recording %d playthroughs: seeds %s",
+        len(seeds), seeds,
+    )
+    logger.info("Resuming from seed=%d, skill=%s", start_seed_val, args.start_skill)
+
+    kb = _kb.Listener(on_press=_on_key_press, on_release=_on_key_release)
+    ms = _ms.Listener(on_move=_on_mouse_move, on_click=_on_mouse_click)
+    kb.start(); ms.start()
+
+    for s_idx in range(seed_start, len(seeds)):
+        if _quit:
+            break
+
+        seed = seeds[s_idx]
+        seed_label = f"[Playthrough {s_idx + 1}/{len(seeds)}]"
+        # start_skill only applies to the first (possibly resumed) seed
+        skill_start = start_skill_idx if s_idx == seed_start else 0
+
+        ok = _record_seed(seed, seed_label, skill_start, args, manifest)
+        if not ok:
+            break
+
+        logger.info("\n%s\nPlaythrough %d/%d complete (seed=%d).\n%s",
+                    "="*70, s_idx + 1, len(seeds), seed, "="*70)
+
+    kb.stop(); ms.stop()
+
+    demos_per_skill = {
+        skill: len([e for e in manifest if e["skill"] == skill])
+        for skill in SKILL_SEQUENCE
+    }
+    logger.info("\nSession complete.")
+    logger.info("Demos collected per skill: %s", demos_per_skill)
+    logger.info("Manifest: %s/manifest.json (%d entries)", args.out_dir, len(manifest))
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -511,17 +586,29 @@ def main() -> None:
         epilog=__doc__,
     )
     ap.add_argument("--out_dir",     default="data/playthrough_demos")
-    ap.add_argument("--seed",        type=int, default=0)
+    ap.add_argument("--seeds",       type=int, nargs="+", default=list(range(20)),
+                    help="Seed values to record, in order (default: 0–19)")
     ap.add_argument("--fps",         type=int, default=20)
+    ap.add_argument("--start_seed",  type=int, default=None,
+                    help="Resume from this seed (must be in --seeds list)")
     ap.add_argument("--start_skill", default="wood", choices=SKILL_SEQUENCE,
-                    help="Resume from this skill (skips earlier ones)")
+                    help="Resume from this skill within --start_seed's playthrough")
     args = ap.parse_args()
 
     print("record_playthrough_demos.py")
-    for k in ("out_dir", "seed", "fps", "start_skill"):
-        print(f"  {k:12s}: {getattr(args, k)}")
+    print(f"  {'out_dir':12s}: {args.out_dir}")
+    print(f"  {'seeds':12s}: {args.seeds}")
+    print(f"  {'fps':12s}: {args.fps}")
+    print(f"  {'start_seed':12s}: {args.start_seed}")
+    print(f"  {'start_skill':12s}: {args.start_skill}")
     print()
     print("Skill sequence:", " → ".join(SKILL_SEQUENCE))
+    print()
+    print("Controls:")
+    print("  F5  = annotate / bookmark current frame")
+    print("  F10 = start recording")
+    print("  F11 = stop + save → next skill")
+    print("  F12 = quit session")
     print()
 
     record(args)
