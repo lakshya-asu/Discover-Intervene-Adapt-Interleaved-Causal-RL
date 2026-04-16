@@ -320,32 +320,18 @@ def _build_action(noop: Dict) -> Dict:
 _WINDOW_KEEPER_RUNNING = False
 
 
-# Center monitor geometry (DP-0: 1920x1080 at offset 1080,546 on DISPLAY=:0)
+# Center monitor position (DP-0 top-left corner at 1080,546).
+# We only MOVE the window — never resize it — so MineStudio's internal
+# frame capture stays consistent with the native window dimensions.
 _MC_WIN_X = 1080
 _MC_WIN_Y = 546
-_MC_WIN_W = 1920
-_MC_WIN_H = 1080
 
 
 def _raise_minecraft_window_once() -> Optional[str]:
-    """Find and raise every Minecraft window, positioning it on the center monitor."""
+    """Find and raise every Minecraft window to the center monitor via Xlib."""
     try:
         import subprocess
-        display_env = os.environ.get("DISPLAY", ":0")
-
-        # Try wmctrl first (simpler, handles window manager decorations)
-        r = subprocess.run(
-            ["wmctrl", "-r", "Minecraft", "-e",
-             f"0,{_MC_WIN_X},{_MC_WIN_Y},{_MC_WIN_W},{_MC_WIN_H}"],
-            capture_output=True, timeout=3,
-        )
-        if r.returncode == 0:
-            # Also raise to front
-            subprocess.run(["wmctrl", "-r", "Minecraft", "-b", "add,above"],
-                           capture_output=True, timeout=3)
-            return "wmctrl"
-
-        # Fallback: Xlib
+        display_env = os.environ.get("DISPLAY", ":1")
         from Xlib import display as _xdisp, X
         from Xlib.protocol import event as _xevent
 
@@ -368,7 +354,8 @@ def _raise_minecraft_window_once() -> Optional[str]:
             win = d.create_resource_object("window", int(win_id, 16))
             win.map()
             d.sync()
-            win.configure(x=_MC_WIN_X, y=_MC_WIN_Y, width=_MC_WIN_W, height=_MC_WIN_H)
+            # Move only — do NOT resize. Resizing confuses MineStudio's frame capture.
+            win.configure(x=_MC_WIN_X, y=_MC_WIN_Y)
             d.sync()
             ev = _xevent.ClientMessage(
                 window=win,
