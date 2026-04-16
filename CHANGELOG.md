@@ -121,8 +121,18 @@ Craft skills (woodpickaxe, furnace, stonepickaxe, iron, ironpickaxe) use GROOT f
 - Jump suppression in underground primer (`is_underground → jump=0`) — caused lake-dive in tested run
 - `force_fwd=-1` for pitch-down steps — reverted with jump suppression
 
-**Results (seed 0, partial — run aborted):**
-- Agent spawned above ground near a lake, jumped in during GROOT-controlled pitch-down steps, then dug down through water. Run killed before completion. Water-breathing prevented death but pathing was wrong.
+**Results:**
+| Seed | n_achieved | wood | stone | coal | ironore | notes |
+|------|-----------|------|-------|------|---------|-------|
+| 0 | 6 | ✅ 0 (spawn) | ❌ 3000 | ❌ 3000 | ❌ 3000 | Stone primer failed; terrain variance |
+| 1 | 4 | ❌ 3000 | ❌ 3000 | ❌ 3000 | ❌ 3000 | Wood GROOT failed; ironpickaxe /give broken |
+
+**Bug found — `_VideoRecordingEnv` wrapper broke `/give` fallback:**
+`_give_item()` uses `getattr(env, "env", None)` to reach the inner `execute_cmd` env.
+When `env` is wrapped as `_VideoRecordingEnv`, `env.env` routes through `__getattr__`
+and resolves to `None` (MineStudio env has no `env.env` chain accessible this way).
+Result: all craft `/give` fallbacks silently returned `False` on this run.
+Fix: unwrap one level with `getattr(env, "_env", env)` before looking up `.env`.
 
 ---
 
@@ -132,8 +142,9 @@ Craft skills (woodpickaxe, furnace, stonepickaxe, iron, ironpickaxe) use GROOT f
 |---------|--------|----------|
 | Coal never found by primer | ❌ Unsolved | 0/8 attempts across it2–it7 |
 | Ironore only found as terrain byproduct | ⚠️ Terrain-dependent | it4 s1, it6 s1 (spawn) |
-| Underground primer walks agent into water | ⚠️ New (it7) | GROOT outputs jump+forward during pitch-down |
-| Wood min_qty=3 not yet measured on normal spawn | ⏳ Pending | it6 seeds had spawn wood |
+| Underground primer walks agent into water | ⚠️ Terrain-dependent | GROOT outputs jump+forward during pitch-down on some spawns |
+| Wood min_qty=3 not yet measured on normal spawn | ⏳ Pending | it6 seeds had spawn wood; it7 s1 wood failed entirely |
+| _VideoRecordingEnv breaks /give fallback | ✅ Fixed (it7.1) | `_give_item` now unwraps `_env` before seeking `execute_cmd` |
 | Diamond never found | ❌ Unsolved | Requires ironore → iron → ironpickaxe first |
 
 ---

@@ -302,7 +302,9 @@ def _inventory_summary(info: Dict) -> str:
 
 def _give_item(skill_name: str, env: Any, obs: Dict, info: Dict) -> Tuple[bool, Dict, Dict]:
     """Execute /give for craft skill_name.  Returns (success, obs, info)."""
-    inner = getattr(env, "env", None)
+    # Unwrap one level of monitoring/recording wrappers (e.g. _VideoRecordingEnv)
+    _real = getattr(env, "_env", env)
+    inner = getattr(_real, "env", None)
     if inner is not None and hasattr(inner, "execute_cmd"):
         try:
             cmd = f"/give @p {_CRAFT_GIVE[skill_name]} 1"
@@ -335,7 +337,8 @@ def _apply_experiment_setup(env: Any, obs: Dict, info: Dict) -> Tuple[Dict, Dict
 
     Safe to call even if execute_cmd is unavailable — degrades gracefully.
     """
-    inner = getattr(env, "env", None)
+    _real = getattr(env, "_env", env)  # unwrap recording wrapper if present
+    inner = getattr(_real, "env", None)
     if inner is None or not hasattr(inner, "execute_cmd"):
         logger.debug("_apply_experiment_setup: execute_cmd unavailable, skipping")
         return obs, info
